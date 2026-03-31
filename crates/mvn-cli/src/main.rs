@@ -45,17 +45,17 @@ enum Commands {
         #[arg(long, default_value = "all")]
         scope: String,
     },
-    /// Download artifact (and optionally its dependencies)
+    /// Download artifact and all transitive dependencies
     Download {
         /// Artifact coordinates (groupId:artifactId:version)
         coord: String,
-        /// Also download all transitive dependencies
+        /// Skip downloading transitive dependencies (only download the artifact itself)
         #[arg(long)]
-        with_deps: bool,
+        no_deps: bool,
         /// Copy downloaded files to this directory
         #[arg(long)]
         output: Option<String>,
-        /// Scope filter when using --with-deps
+        /// Scope filter for dependency downloads (compile, runtime, test, all)
         #[arg(long, default_value = "compile")]
         scope: String,
     },
@@ -240,7 +240,7 @@ async fn cmd_deps(
 async fn cmd_download(
     downloader: &ArtifactDownloader,
     coord_str: &str,
-    with_deps: bool,
+    no_deps: bool,
     output: Option<&str>,
     scope_str: &str,
 ) -> Result<()> {
@@ -248,7 +248,7 @@ async fn cmd_download(
 
     let mut downloaded_paths: Vec<PathBuf> = Vec::new();
 
-    if with_deps {
+    if !no_deps {
         let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
 
         let pb = spinner("Resolving dependencies...");
@@ -437,10 +437,10 @@ async fn main() {
         Commands::Deps { coord, tree, scope } => cmd_deps(&downloader, &coord, tree, &scope).await,
         Commands::Download {
             coord,
-            with_deps,
+            no_deps,
             output,
             scope,
-        } => cmd_download(&downloader, &coord, with_deps, output.as_deref(), &scope).await,
+        } => cmd_download(&downloader, &coord, no_deps, output.as_deref(), &scope).await,
         Commands::Search { coord } => cmd_search(&downloader, &coord).await,
     };
 

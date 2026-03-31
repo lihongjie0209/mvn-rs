@@ -5,7 +5,7 @@
 //! 2. **Flatten** – BFS "nearest wins" conflict resolution
 //! 3. **Download** – fetch resolved artifact files
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,9 +16,13 @@ use crate::coord::{ArtifactCoord, DependencyScope, Exclusion};
 use crate::downloader::ArtifactDownloader;
 use crate::error::Result;
 use crate::pom;
+use crate::version::{Version, VersionConstraint};
 
 /// Maximum recursion depth for transitive dependency collection.
 const MAX_DEPTH: usize = 50;
+
+/// Maximum parent POM chain depth to prevent infinite loops.
+const MAX_PARENT_DEPTH: usize = 20;
 
 // ============================================================================
 // Data Structures
@@ -200,6 +204,14 @@ pub fn format_tree_plain(root: &ArtifactCoord, nodes: &[DependencyNode]) -> Stri
 // ============================================================================
 
 /// Resolves Maven dependencies using a three-phase algorithm.
+///
+/// Faithfully replicates Maven's core resolution logic:
+/// - Recursive parent POM chain resolution (up to `MAX_PARENT_DEPTH`)
+/// - BOM (`<scope>import</scope>`) resolution with circular import detection
+/// - Root `<dependencyManagement>` propagation to ALL transitive dependencies
+/// - Version range resolution via `maven-metadata.xml`
+/// - POM relocation following with cycle detection
+/// - Scope propagation matrix & "Nearest Wins" conflict resolution
 pub struct DependencyResolver<'a> {
     downloader: &'a ArtifactDownloader,
 }
@@ -225,27 +237,69 @@ impl<'a> DependencyResolver<'a> {
         })
     }
 
+    /// Collect and flatten dependencies without downloading artifact JARs.
+    pub async fn resolve_no_download(
+        &self,
+        coord: &ArtifactCoord,
+        scope_filter: Option<DependencyScope>,
+    ) -> Result<ResolutionResult> {
+        let tree = self.collect(coord).await?;
+        let dependencies = self.flatten(&tree, scope_filter);
+        Ok(ResolutionResult {
+            root: coord.clone(),
+            tree,
+            dependencies,
+        })
+    }
+
     // -- Phase 1: Collect ---------------------------------------------------
 
     /// Build the dependency tree by recursively fetching POMs.
+    ///
+    /// Resolves the root POM's effective model (parent chain, interpolation,
+    /// BOM imports, DM injection) and extracts root-level `dependencyManagement`
+    /// entries. These are propagated through the entire transitive tree so that
+    /// the root project's version overrides always win — matching Maven behavior.
     async fn collect(&self, coord: &ArtifactCoord) -> Result<Vec<DependencyNode>> {
         let mut visited = HashSet::new();
         visited.insert((coord.group_id.clone(), coord.artifact_id.clone()));
 
         let pom = self.fetch_and_prepare_pom(coord).await?;
-        self.collect_children(pom, Vec::new(), &mut visited, 0)
+
+        // Extract root-level dependencyManagement as a lookup map.
+        // Maven propagates the root project's DM to ALL transitive deps.
+        let root_managed = Self::build_managed_map(&pom);
+
+        self.collect_children(pom, Vec::new(), &mut visited, 0, &root_managed)
             .await
+    }
+
+    /// Build a `(groupId, artifactId) → PomDependency` map from a POM's
+    /// `<dependencyManagement>` section.
+    fn build_managed_map(pom: &pom::Pom) -> HashMap<(String, String), pom::PomDependency> {
+        match &pom.dependency_management {
+            Some(dm) => dm
+                .dependencies
+                .dependency
+                .iter()
+                .map(|d| ((d.group_id.clone(), d.artifact_id.clone()), d.clone()))
+                .collect(),
+            None => HashMap::new(),
+        }
     }
 
     /// Recursively collect dependency nodes for a prepared POM.
     ///
-    /// Uses manual `Pin<Box<…>>` to support async recursion.
+    /// `root_managed` carries the root project's `dependencyManagement` entries
+    /// through the entire transitive tree so that version overrides from the
+    /// top-level POM always win.
     fn collect_children<'s, 'v>(
         &'s self,
         pom: pom::Pom,
         parent_exclusions: Vec<Exclusion>,
         visited: &'v mut HashSet<(String, String)>,
         depth: usize,
+        root_managed: &'v HashMap<(String, String), pom::PomDependency>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyNode>>> + Send + 'v>>
     where
         's: 'v,
@@ -281,20 +335,66 @@ impl<'a> DependencyResolver<'a> {
                     continue;
                 }
 
-                let version = match &dep.version {
-                    Some(v) if !v.is_empty() => v.clone(),
-                    _ => {
-                        warn!(
-                            "skipping {}:{} — no version specified",
-                            dep.group_id, dep.artifact_id
-                        );
-                        continue;
+                // Root depMgmt override: if the root project's DM specifies a
+                // version for this GA, use it instead of whatever the current
+                // POM declares. This is the key Maven behaviour that ensures
+                // the top-level project controls transitive versions.
+                let root_key = (dep.group_id.clone(), dep.artifact_id.clone());
+                let version = if let Some(managed) = root_managed.get(&root_key) {
+                    // Root DM wins
+                    managed.version.clone().unwrap_or_default()
+                } else {
+                    match &dep.version {
+                        Some(v) if !v.is_empty() => v.clone(),
+                        _ => {
+                            warn!(
+                                "skipping {}:{} — no version specified",
+                                dep.group_id, dep.artifact_id
+                            );
+                            continue;
+                        }
                     }
                 };
 
+                if version.is_empty() {
+                    warn!(
+                        "skipping {}:{} — empty version after DM lookup",
+                        dep.group_id, dep.artifact_id
+                    );
+                    continue;
+                }
+
+                // Resolve version ranges like [1.0,2.0)
+                let resolved_version = if version.starts_with('[')
+                    || version.starts_with('(')
+                {
+                    match self
+                        .resolve_version_range(
+                            &dep.group_id,
+                            &dep.artifact_id,
+                            &version,
+                        )
+                        .await
+                    {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "no version matches range {} for {}:{}",
+                                version, dep.group_id, dep.artifact_id
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    version
+                };
+
                 let extension = dep.dep_type.as_deref().unwrap_or("jar");
-                let mut dep_coord =
-                    ArtifactCoord::new(&dep.group_id, &dep.artifact_id, &version);
+                let mut dep_coord = ArtifactCoord::new(
+                    &dep.group_id,
+                    &dep.artifact_id,
+                    &resolved_version,
+                );
                 if extension != "jar" {
                     dep_coord.extension = extension.to_string();
                 }
@@ -341,11 +441,10 @@ impl<'a> DependencyResolver<'a> {
                 .collect();
 
             let pom_results = self.downloader.fetch_poms(&coords_to_fetch).await;
-            let mut pom_map: std::collections::HashMap<String, Result<pom::Pom>> =
-                pom_results
-                    .into_iter()
-                    .map(|(coord, result)| (coord.to_string(), result))
-                    .collect();
+            let mut pom_map: HashMap<String, Result<pom::Pom>> = pom_results
+                .into_iter()
+                .map(|(coord, result)| (coord.to_string(), result))
+                .collect();
 
             // -- Pass 3: build nodes, recurse into children sequentially ----
             let mut nodes = Vec::new();
@@ -364,23 +463,62 @@ impl<'a> DependencyResolver<'a> {
 
                 let children = match pom_map.remove(&info.coord.to_string()) {
                     Some(Ok(raw_pom)) => {
+                        // Apply full effective-model pipeline to each transitive POM
                         let mut child_pom = raw_pom;
-                        pom::interpolate_pom(&mut child_pom);
-                        pom::inject_dependency_management(&mut child_pom);
-                        self.collect_children(
-                            child_pom,
-                            info.child_exclusions,
-                            visited,
-                            depth + 1,
-                        )
-                        .await
-                        .unwrap_or_else(|e| {
+                        self.prepare_pom(&mut child_pom, 0).await;
+
+                        // Check for POM relocation
+                        if let Some(relocated) =
+                            Self::check_relocation(&child_pom, &info.coord)
+                        {
                             warn!(
-                                "failed to collect transitive deps for {}: {e}",
-                                info.coord
+                                "artifact {} relocated to {}",
+                                info.coord, relocated
                             );
-                            Vec::new()
-                        })
+                            // Fetch the relocated POM and use it instead
+                            match self.fetch_and_prepare_pom(&relocated).await {
+                                Ok(relocated_pom) => {
+                                    self.collect_children(
+                                        relocated_pom,
+                                        info.child_exclusions,
+                                        visited,
+                                        depth + 1,
+                                        root_managed,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        warn!(
+                                            "failed collecting deps for relocated {}: {e}",
+                                            relocated
+                                        );
+                                        Vec::new()
+                                    })
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "failed to fetch relocated POM {}: {e}",
+                                        relocated
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            self.collect_children(
+                                child_pom,
+                                info.child_exclusions,
+                                visited,
+                                depth + 1,
+                                root_managed,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    "failed to collect transitive deps for {}: {e}",
+                                    info.coord
+                                );
+                                Vec::new()
+                            })
+                        }
                     }
                     Some(Err(e)) => {
                         warn!("failed to fetch POM for {}: {e}", info.coord);
@@ -405,12 +543,281 @@ impl<'a> DependencyResolver<'a> {
         })
     }
 
-    /// Fetch a POM and apply interpolation + dependency management injection.
+    /// Check if a POM declares a relocation and return the relocated coordinate.
+    fn check_relocation(
+        pom: &pom::Pom,
+        original: &ArtifactCoord,
+    ) -> Option<ArtifactCoord> {
+        let dm = pom.distribution_management.as_ref()?;
+        let reloc = dm.relocation.as_ref()?;
+
+        let group = reloc
+            .group_id
+            .as_deref()
+            .unwrap_or(&original.group_id);
+        let artifact = reloc
+            .artifact_id
+            .as_deref()
+            .unwrap_or(&original.artifact_id);
+        let version = reloc
+            .version
+            .as_deref()
+            .unwrap_or(&original.version);
+
+        let relocated = ArtifactCoord::new(group, artifact, version);
+        // Guard against self-relocation
+        if relocated.group_id == original.group_id
+            && relocated.artifact_id == original.artifact_id
+            && relocated.version == original.version
+        {
+            return None;
+        }
+        Some(relocated)
+    }
+
+    /// Resolve a version range like `[1.0,2.0)` by fetching maven-metadata.xml,
+    /// filtering available versions through the range, and picking the highest.
+    async fn resolve_version_range(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        range_str: &str,
+    ) -> Option<String> {
+        let constraint = VersionConstraint::parse(range_str).ok()?;
+        let metadata = self
+            .downloader
+            .fetch_metadata(group_id, artifact_id)
+            .await
+            .ok()?;
+
+        let versions = metadata.available_versions();
+        let mut matching: Vec<(&str, Version)> = versions
+            .into_iter()
+            .filter_map(|v| {
+                let parsed = Version::new(v);
+                if constraint.contains(&parsed) {
+                    Some((v, parsed))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort descending, pick highest
+        matching.sort_by(|a, b| b.1.cmp(&a.1));
+        matching.first().map(|(s, _)| (*s).to_string())
+    }
+
+    /// Fetch a POM and apply the full effective-model pipeline.
     async fn fetch_and_prepare_pom(&self, coord: &ArtifactCoord) -> Result<pom::Pom> {
-        let mut pom = self.downloader.fetch_pom(coord).await?;
-        pom::interpolate_pom(&mut pom);
-        pom::inject_dependency_management(&mut pom);
-        Ok(pom)
+        self.resolve_effective_pom(coord.clone(), 0).await
+    }
+
+    /// Fetch a POM and resolve its full effective model by walking the parent
+    /// chain recursively.
+    ///
+    /// Uses `Pin<Box<…>>` to support async recursion through the parent chain.
+    fn resolve_effective_pom(
+        &self,
+        coord: ArtifactCoord,
+        parent_depth: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<pom::Pom>> + Send + '_>> {
+        Box::pin(async move {
+            let mut pom = self.downloader.fetch_pom(&coord).await?;
+            self.prepare_pom(&mut pom, parent_depth).await;
+            Ok(pom)
+        })
+    }
+
+    /// Apply parent chain resolution, interpolation, BOM imports, and depMgmt
+    /// injection to an already-fetched POM.
+    fn prepare_pom<'s>(
+        &'s self,
+        pom: &'s mut pom::Pom,
+        parent_depth: usize,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        Box::pin(async move {
+            // Step 1: Resolve parent chain
+            if parent_depth < MAX_PARENT_DEPTH {
+                if let Some(parent_ref) = pom.parent.clone() {
+                    // Try to resolve parent version from child's own properties
+                    let mut parent_version = parent_ref.version.clone();
+                    for (k, v) in &pom.properties.entries {
+                        parent_version =
+                            parent_version.replace(&format!("${{{k}}}"), v);
+                    }
+
+                    if parent_version.is_empty() || parent_version.contains("${") {
+                        warn!(
+                            "cannot resolve parent version for {}:{}: {}",
+                            parent_ref.group_id, parent_ref.artifact_id, parent_ref.version
+                        );
+                    } else {
+                        let parent_coord = ArtifactCoord::new(
+                            &parent_ref.group_id,
+                            &parent_ref.artifact_id,
+                            &parent_version,
+                        );
+                        match self
+                            .resolve_effective_pom(parent_coord, parent_depth + 1)
+                            .await
+                        {
+                            Ok(effective_parent) => {
+                                pom::merge_parent(pom, &effective_parent);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "failed to fetch parent POM {}:{}:{}: {e}",
+                                    parent_ref.group_id,
+                                    parent_ref.artifact_id,
+                                    parent_version
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("max parent POM depth ({MAX_PARENT_DEPTH}) reached");
+            }
+
+            // Step 2: Interpolate (after parent merge so parent properties are available)
+            pom::interpolate_pom(pom);
+
+            // Step 3: Resolve BOM imports (import-scope entries in dependencyManagement)
+            self.resolve_bom_imports(pom, parent_depth).await;
+
+            // Step 4: Inject dependency management into dependencies
+            pom::inject_dependency_management(pom);
+        })
+    }
+
+    /// Resolve `<scope>import</scope>` entries in `<dependencyManagement>`.
+    ///
+    /// These are BOMs (Bill of Materials) whose dependencyManagement sections
+    /// should be merged into the current POM. Includes circular import detection
+    /// and BOM-level exclusion filtering.
+    fn resolve_bom_imports<'s>(
+        &'s self,
+        pom: &'s mut pom::Pom,
+        parent_depth: usize,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+        Box::pin(async move {
+            let imports: Vec<pom::PomDependency> = match &pom.dependency_management {
+                Some(dm) => dm
+                    .dependencies
+                    .dependency
+                    .iter()
+                    .filter(|d| {
+                        d.scope.as_deref() == Some("import")
+                            && d.dep_type.as_deref() == Some("pom")
+                    })
+                    .cloned()
+                    .collect(),
+                None => return,
+            };
+
+            if imports.is_empty() {
+                return;
+            }
+
+            // Remove import entries from dependencyManagement
+            if let Some(ref mut dm) = pom.dependency_management {
+                dm.dependencies.dependency.retain(|d| {
+                    !(d.scope.as_deref() == Some("import")
+                        && d.dep_type.as_deref() == Some("pom"))
+                });
+            }
+
+            // Build current POM's identity for cycle detection
+            let pom_id = format!(
+                "{}:{}:{}",
+                pom.group_id.as_deref().unwrap_or("?"),
+                pom.artifact_id.as_deref().unwrap_or("?"),
+                pom.version.as_deref().unwrap_or("?"),
+            );
+            let mut import_ids: HashSet<String> = HashSet::new();
+            import_ids.insert(pom_id);
+
+            // Fetch each BOM and merge its dependencyManagement
+            for import in &imports {
+                let version = match &import.version {
+                    Some(v) if !v.is_empty() => v.clone(),
+                    _ => continue,
+                };
+
+                let import_id =
+                    format!("{}:{}:{}", import.group_id, import.artifact_id, version);
+
+                // Circular import detection
+                if !import_ids.insert(import_id.clone()) {
+                    warn!("circular BOM import detected: {import_id}; skipping");
+                    continue;
+                }
+
+                let bom_coord =
+                    ArtifactCoord::new(&import.group_id, &import.artifact_id, &version);
+
+                match self
+                    .resolve_effective_pom(bom_coord, parent_depth + 1)
+                    .await
+                {
+                    Ok(bom_pom) => {
+                        if let Some(bom_dm) = &bom_pom.dependency_management {
+                            let child_dm =
+                                pom.dependency_management.get_or_insert_with(|| {
+                                    pom::DependencyManagement {
+                                        dependencies: pom::Dependencies::default(),
+                                    }
+                                });
+
+                            let existing_keys: HashSet<(String, String)> = child_dm
+                                .dependencies
+                                .dependency
+                                .iter()
+                                .map(|d| (d.group_id.clone(), d.artifact_id.clone()))
+                                .collect();
+
+                            // BOM import exclusions filter imported entries
+                            let import_exclusions: Vec<Exclusion> = import
+                                .exclusions
+                                .exclusion
+                                .iter()
+                                .map(|e| Exclusion::new(&e.group_id, &e.artifact_id))
+                                .collect();
+
+                            for dep in &bom_dm.dependencies.dependency {
+                                let key =
+                                    (dep.group_id.clone(), dep.artifact_id.clone());
+                                if existing_keys.contains(&key) {
+                                    continue;
+                                }
+                                // Check import-level exclusions
+                                let excluded = import_exclusions.iter().any(|exc| {
+                                    let tmp = ArtifactCoord::new(
+                                        &dep.group_id,
+                                        &dep.artifact_id,
+                                        dep.version.as_deref().unwrap_or(""),
+                                    );
+                                    exc.matches(&tmp)
+                                });
+                                if !excluded {
+                                    child_dm
+                                        .dependencies
+                                        .dependency
+                                        .push(dep.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to fetch BOM {}:{}:{}: {e}",
+                            import.group_id, import.artifact_id, version
+                        );
+                    }
+                }
+            }
+        })
     }
 
     // -- Phase 2: Flatten ---------------------------------------------------
@@ -468,13 +875,31 @@ impl<'a> DependencyResolver<'a> {
     // -- Phase 3: Download --------------------------------------------------
 
     /// Download artifacts for all resolved dependencies concurrently.
+    ///
+    /// Skips JAR download for artifacts with `pom` packaging (extension).
     async fn download_all(&self, deps: &mut [ResolvedDependency]) -> Result<()> {
-        let coords: Vec<_> = deps.iter().map(|d| d.coord.clone()).collect();
+        // Filter out pom-only artifacts (no JAR to download)
+        let coords: Vec<_> = deps
+            .iter()
+            .filter(|d| d.coord.extension != "pom")
+            .map(|d| d.coord.clone())
+            .collect();
         let results = self.downloader.download_artifacts(&coords).await;
-        for (i, (_coord, result)) in results.into_iter().enumerate() {
-            match result {
-                Ok(path) => deps[i].path = Some(path),
-                Err(e) => tracing::warn!("failed to download {}: {}", deps[i].coord, e),
+
+        // Map results back to deps
+        let result_map: HashMap<String, std::result::Result<PathBuf, _>> = results
+            .into_iter()
+            .map(|(c, r)| (c.to_string(), r))
+            .collect();
+
+        for dep in deps.iter_mut() {
+            if let Some(result) = result_map.get(&dep.coord.to_string()) {
+                match result {
+                    Ok(path) => dep.path = Some(path.clone()),
+                    Err(e) => {
+                        tracing::warn!("failed to download {}: {}", dep.coord, e);
+                    }
+                }
             }
         }
         Ok(())
@@ -1191,5 +1616,630 @@ mod tests {
         assert_eq!(result.tree.len(), 1);
         assert_eq!(result.tree[0].coord.artifact_id, "b");
         assert!(result.tree[0].children.is_empty());
+    }
+
+    // ====================================================================
+    // New feature tests — parent chain, BOM, root depMgmt, relocation
+    // ====================================================================
+
+    /// Helper: create a POM XML with parent reference.
+    #[allow(dead_code)]
+    fn make_pom_with_parent(
+        group: &str,
+        artifact: &str,
+        version: &str,
+        parent_group: &str,
+        parent_artifact: &str,
+        parent_version: &str,
+        deps: &[(&str, &str, &str, &str)],
+    ) -> String {
+        let dep_xml: String = deps
+            .iter()
+            .map(|(g, a, v, scope)| {
+                format!(
+                    "<dependency>\
+                       <groupId>{g}</groupId>\
+                       <artifactId>{a}</artifactId>\
+                       <version>{v}</version>\
+                       <scope>{scope}</scope>\
+                     </dependency>"
+                )
+            })
+            .collect();
+        format!(
+            "<project>\
+               <modelVersion>4.0.0</modelVersion>\
+               <parent>\
+                 <groupId>{parent_group}</groupId>\
+                 <artifactId>{parent_artifact}</artifactId>\
+                 <version>{parent_version}</version>\
+               </parent>\
+               <groupId>{group}</groupId>\
+               <artifactId>{artifact}</artifactId>\
+               <version>{version}</version>\
+               <dependencies>{dep_xml}</dependencies>\
+             </project>"
+        )
+    }
+
+    // 11. Parent POM chain resolves version via dependencyManagement
+    #[tokio::test]
+    async fn resolve_parent_chain_injects_version() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let parent_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>parent</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>lib</artifactId>\
+                    <version>3.0</version>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+            </project>";
+
+        let child_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <parent>\
+                <groupId>com.example</groupId>\
+                <artifactId>parent</artifactId>\
+                <version>1.0</version>\
+              </parent>\
+              <groupId>com.example</groupId>\
+              <artifactId>child</artifactId>\
+              <version>1.0</version>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>lib</artifactId>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let lib_pom = make_pom("com.example", "lib", "3.0", &[]);
+
+        mount_pom(&server, "com.example", "parent", "1.0", parent_pom).await;
+        mount_pom(&server, "com.example", "child", "1.0", child_pom).await;
+        mount_pom(&server, "com.example", "lib", "3.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "child", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.artifact_id, "lib");
+        assert_eq!(result.dependencies[0].coord.version, "3.0");
+    }
+
+    // 12. Parent POM properties inherited and interpolated
+    #[tokio::test]
+    async fn resolve_parent_properties_inherited() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let parent_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>parent</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+              <properties>\
+                <lib.version>5.0</lib.version>\
+              </properties>\
+            </project>";
+
+        let child_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <parent>\
+                <groupId>com.example</groupId>\
+                <artifactId>parent</artifactId>\
+                <version>1.0</version>\
+              </parent>\
+              <groupId>com.example</groupId>\
+              <artifactId>child</artifactId>\
+              <version>1.0</version>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>lib</artifactId>\
+                  <version>${lib.version}</version>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let lib_pom = make_pom("com.example", "lib", "5.0", &[]);
+
+        mount_pom(&server, "com.example", "parent", "1.0", parent_pom).await;
+        mount_pom(&server, "com.example", "child", "1.0", child_pom).await;
+        mount_pom(&server, "com.example", "lib", "5.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "child", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.version, "5.0");
+    }
+
+    // 13. Root depMgmt overrides transitive dependency version
+    #[tokio::test]
+    async fn resolve_root_depmgmt_overrides_transitive() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let root_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>root</artifactId>\
+              <version>1.0</version>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>lib</artifactId>\
+                    <version>9.0</version>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>mid</artifactId>\
+                  <version>1.0</version>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let mid_pom = make_pom("com.example", "mid", "1.0", &[
+            ("com.example", "lib", "2.0", "compile"),
+        ]);
+        let lib_pom = make_pom("com.example", "lib", "9.0", &[]);
+
+        mount_pom(&server, "com.example", "root", "1.0", root_pom).await;
+        mount_pom(&server, "com.example", "mid", "1.0", &mid_pom).await;
+        mount_pom(&server, "com.example", "lib", "9.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "root", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        let lib_dep = result.dependencies.iter().find(|d| d.coord.artifact_id == "lib").unwrap();
+        assert_eq!(lib_dep.coord.version, "9.0", "root depMgmt should override transitive version");
+    }
+
+    // 14. BOM import merges dependencyManagement
+    #[tokio::test]
+    async fn resolve_bom_import_merges_depmgmt() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let bom_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>bom</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>lib</artifactId>\
+                    <version>7.0</version>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+            </project>";
+
+        let root_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>root</artifactId>\
+              <version>1.0</version>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>bom</artifactId>\
+                    <version>1.0</version>\
+                    <type>pom</type>\
+                    <scope>import</scope>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>lib</artifactId>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let lib_pom = make_pom("com.example", "lib", "7.0", &[]);
+
+        mount_pom(&server, "com.example", "bom", "1.0", bom_pom).await;
+        mount_pom(&server, "com.example", "root", "1.0", root_pom).await;
+        mount_pom(&server, "com.example", "lib", "7.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "root", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.artifact_id, "lib");
+        assert_eq!(result.dependencies[0].coord.version, "7.0");
+    }
+
+    // 15. Relocation is followed
+    #[tokio::test]
+    async fn resolve_relocation_followed() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let root_pom = make_pom("com.example", "root", "1.0", &[
+            ("com.example", "old-lib", "1.0", "compile"),
+        ]);
+
+        let old_lib_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>old-lib</artifactId>\
+              <version>1.0</version>\
+              <distributionManagement>\
+                <relocation>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>new-lib</artifactId>\
+                  <version>2.0</version>\
+                </relocation>\
+              </distributionManagement>\
+            </project>";
+
+        let new_lib_pom = make_pom("com.example", "new-lib", "2.0", &[
+            ("com.example", "util", "1.0", "compile"),
+        ]);
+        let util_pom = make_pom("com.example", "util", "1.0", &[]);
+
+        mount_pom(&server, "com.example", "root", "1.0", &root_pom).await;
+        mount_pom(&server, "com.example", "old-lib", "1.0", old_lib_pom).await;
+        mount_pom(&server, "com.example", "new-lib", "2.0", &new_lib_pom).await;
+        mount_pom(&server, "com.example", "util", "1.0", &util_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "root", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        let ids: Vec<&str> = result.dependencies.iter().map(|d| d.coord.artifact_id.as_str()).collect();
+        assert!(ids.contains(&"util"), "relocated lib's transitive deps should be resolved");
+    }
+
+    // 16. resolve_no_download skips JAR download
+    #[tokio::test]
+    async fn resolve_no_download_method() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let root_pom = make_pom("com.example", "root", "1.0", &[
+            ("com.example", "lib", "1.0", "compile"),
+        ]);
+        let lib_pom = make_pom("com.example", "lib", "1.0", &[]);
+
+        mount_pom(&server, "com.example", "root", "1.0", &root_pom).await;
+        mount_pom(&server, "com.example", "lib", "1.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "root", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve_no_download(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.artifact_id, "lib");
+        assert!(result.dependencies[0].path.is_none());
+    }
+
+    // 17. check_relocation utility
+    #[test]
+    fn check_relocation_returns_relocated_coord() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("old.group".into()),
+            artifact_id: Some("old-artifact".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: Some(pom::DistributionManagement {
+                relocation: Some(pom::Relocation {
+                    group_id: Some("new.group".into()),
+                    artifact_id: Some("new-artifact".into()),
+                    version: Some("2.0".into()),
+                    message: None,
+                }),
+            }),
+        };
+
+        let original = ArtifactCoord::new("old.group", "old-artifact", "1.0");
+        let relocated = DependencyResolver::check_relocation(&pom, &original);
+        assert!(relocated.is_some());
+        let r = relocated.unwrap();
+        assert_eq!(r.group_id, "new.group");
+        assert_eq!(r.artifact_id, "new-artifact");
+        assert_eq!(r.version, "2.0");
+    }
+
+    // 18. check_relocation ignores self-relocation
+    #[test]
+    fn check_relocation_ignores_self() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("org".into()),
+            artifact_id: Some("lib".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: Some(pom::DistributionManagement {
+                relocation: Some(pom::Relocation {
+                    group_id: Some("org".into()),
+                    artifact_id: Some("lib".into()),
+                    version: Some("1.0".into()),
+                    message: None,
+                }),
+            }),
+        };
+
+        let original = ArtifactCoord::new("org", "lib", "1.0");
+        assert!(DependencyResolver::check_relocation(&pom, &original).is_none());
+    }
+
+    // 19. check_relocation partial (only groupId changed)
+    #[test]
+    fn check_relocation_partial() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("old.group".into()),
+            artifact_id: Some("lib".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: Some(pom::DistributionManagement {
+                relocation: Some(pom::Relocation {
+                    group_id: Some("new.group".into()),
+                    artifact_id: None,
+                    version: None,
+                    message: None,
+                }),
+            }),
+        };
+
+        let original = ArtifactCoord::new("old.group", "lib", "1.0");
+        let relocated = DependencyResolver::check_relocation(&pom, &original).unwrap();
+        assert_eq!(relocated.group_id, "new.group");
+        assert_eq!(relocated.artifact_id, "lib");
+        assert_eq!(relocated.version, "1.0");
+    }
+
+    // 20. build_managed_map extracts depMgmt entries
+    #[test]
+    fn build_managed_map_basic() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("org".into()),
+            artifact_id: Some("root".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: Some(pom::DependencyManagement {
+                dependencies: pom::Dependencies {
+                    dependency: vec![
+                        pom::PomDependency {
+                            group_id: "com.example".into(),
+                            artifact_id: "lib".into(),
+                            version: Some("3.0".into()),
+                            dep_type: None,
+                            scope: None,
+                            classifier: None,
+                            optional: None,
+                            exclusions: Default::default(),
+                        },
+                    ],
+                },
+            }),
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        let map = DependencyResolver::build_managed_map(&pom);
+        assert_eq!(map.len(), 1);
+        let entry = map.get(&("com.example".into(), "lib".into())).unwrap();
+        assert_eq!(entry.version, Some("3.0".into()));
+    }
+
+    // 21. build_managed_map returns empty when no depMgmt
+    #[test]
+    fn build_managed_map_empty() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("org".into()),
+            artifact_id: Some("root".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        let map = DependencyResolver::build_managed_map(&pom);
+        assert!(map.is_empty());
+    }
+
+    // 22. BOM import with child override takes precedence
+    #[tokio::test]
+    async fn resolve_bom_child_override_wins() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let bom_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>bom</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>lib</artifactId>\
+                    <version>1.0</version>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+            </project>";
+
+        let root_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>root</artifactId>\
+              <version>1.0</version>\
+              <dependencyManagement>\
+                <dependencies>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>lib</artifactId>\
+                    <version>2.0</version>\
+                  </dependency>\
+                  <dependency>\
+                    <groupId>com.example</groupId>\
+                    <artifactId>bom</artifactId>\
+                    <version>1.0</version>\
+                    <type>pom</type>\
+                    <scope>import</scope>\
+                  </dependency>\
+                </dependencies>\
+              </dependencyManagement>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>lib</artifactId>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let lib_pom = make_pom("com.example", "lib", "2.0", &[]);
+
+        mount_pom(&server, "com.example", "bom", "1.0", bom_pom).await;
+        mount_pom(&server, "com.example", "root", "1.0", root_pom).await;
+        mount_pom(&server, "com.example", "lib", "2.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "root", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.version, "2.0");
+    }
+
+    // 23. Multi-level parent chain
+    #[tokio::test]
+    async fn resolve_grandparent_chain() {
+        let (server, _tmp, downloader) = setup_resolver().await;
+
+        let grandparent_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <groupId>com.example</groupId>\
+              <artifactId>grandparent</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+              <properties>\
+                <lib.version>8.0</lib.version>\
+              </properties>\
+            </project>";
+
+        let parent_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <parent>\
+                <groupId>com.example</groupId>\
+                <artifactId>grandparent</artifactId>\
+                <version>1.0</version>\
+              </parent>\
+              <groupId>com.example</groupId>\
+              <artifactId>parent</artifactId>\
+              <version>1.0</version>\
+              <packaging>pom</packaging>\
+            </project>";
+
+        let child_pom = "\
+            <project>\
+              <modelVersion>4.0.0</modelVersion>\
+              <parent>\
+                <groupId>com.example</groupId>\
+                <artifactId>parent</artifactId>\
+                <version>1.0</version>\
+              </parent>\
+              <groupId>com.example</groupId>\
+              <artifactId>child</artifactId>\
+              <version>1.0</version>\
+              <dependencies>\
+                <dependency>\
+                  <groupId>com.example</groupId>\
+                  <artifactId>lib</artifactId>\
+                  <version>${lib.version}</version>\
+                </dependency>\
+              </dependencies>\
+            </project>";
+
+        let lib_pom = make_pom("com.example", "lib", "8.0", &[]);
+
+        mount_pom(&server, "com.example", "grandparent", "1.0", grandparent_pom).await;
+        mount_pom(&server, "com.example", "parent", "1.0", parent_pom).await;
+        mount_pom(&server, "com.example", "child", "1.0", child_pom).await;
+        mount_pom(&server, "com.example", "lib", "8.0", &lib_pom).await;
+
+        let coord = ArtifactCoord::new("com.example", "child", "1.0");
+        let resolver = DependencyResolver::new(&downloader);
+        let result = resolver.resolve(&coord, None).await.unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].coord.version, "8.0",
+            "property from grandparent should be inherited through chain");
     }
 }

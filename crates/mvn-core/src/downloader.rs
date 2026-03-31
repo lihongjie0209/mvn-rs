@@ -5,6 +5,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tokio::sync::Semaphore;
 
 use crate::coord::ArtifactCoord;
@@ -305,7 +306,7 @@ impl ArtifactDownloader {
         Err(last_err.unwrap_or_else(|| MvnError::NetworkError("max retries exceeded".into())))
     }
 
-    /// Download artifact bytes and verify SHA-1 checksum.
+    /// Download artifact bytes and verify checksum (SHA-256 preferred, SHA-1 fallback).
     async fn download_with_checksum(
         &self,
         url: &str,
@@ -319,14 +320,33 @@ impl ArtifactDownloader {
                 coord: coord.to_string(),
             })?;
 
-        let sha1_url = format!("{}.sha1", url);
+        // Try SHA-256 first (modern), then SHA-1 (legacy)
+        let sha256_url = format!("{url}.sha256");
+        if let Ok(Some(checksum_content)) = self.fetch_text(&sha256_url, credentials).await {
+            if let Some(expected) = parse_hex_checksum(&checksum_content, 64) {
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                let actual = hex::encode(hasher.finalize());
+                if actual != expected {
+                    return Err(MvnError::ChecksumMismatch {
+                        artifact: coord.to_string(),
+                        expected,
+                        actual,
+                    });
+                }
+                tracing::debug!("SHA-256 checksum verified for {}", coord);
+                return Ok(data);
+            }
+        }
+
+        // Fallback to SHA-1
+        let sha1_url = format!("{url}.sha1");
         match self.fetch_text(&sha1_url, credentials).await? {
             Some(checksum_content) => {
-                if let Some(expected) = parse_sha1_checksum(&checksum_content) {
+                if let Some(expected) = parse_hex_checksum(&checksum_content, 40) {
                     let mut hasher = Sha1::new();
                     hasher.update(&data);
                     let actual = hex::encode(hasher.finalize());
-
                     if actual != expected {
                         return Err(MvnError::ChecksumMismatch {
                             artifact: coord.to_string(),
@@ -334,7 +354,7 @@ impl ArtifactDownloader {
                             actual,
                         });
                     }
-                    tracing::debug!("checksum verified for {}", coord);
+                    tracing::debug!("SHA-1 checksum verified for {}", coord);
                 } else {
                     tracing::warn!(
                         "could not parse .sha1 content for {}, skipping verification",
@@ -343,7 +363,7 @@ impl ArtifactDownloader {
                 }
             }
             None => {
-                tracing::warn!("no .sha1 available for {}, skipping verification", coord);
+                tracing::warn!("no checksum available for {}, skipping verification", coord);
             }
         }
 
@@ -570,19 +590,25 @@ impl ArtifactDownloader {
 // Checksum parsing helper
 // ---------------------------------------------------------------------------
 
-/// Parse a SHA-1 checksum from `.sha1` file content.
+/// Parse a hex checksum from a checksum file content.
 ///
-/// The file may contain just the hex hash, or `"hash  filename"`.
-fn parse_sha1_checksum(content: &str) -> Option<String> {
+/// `expected_len` is the expected hex string length (40 for SHA-1, 64 for SHA-256).
+/// Handles formats: hash-only, "hash  filename", trailing whitespace.
+fn parse_hex_checksum(content: &str, expected_len: usize) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Take the first whitespace-delimited token
-    let hash = trimmed.split_whitespace().next()?;
-    // Validate: SHA-1 is 40 hex characters
-    if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash.to_lowercase())
+
+    // Try first token (handles "hash  filename" format)
+    let candidate = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or(trimmed)
+        .to_lowercase();
+
+    if candidate.len() == expected_len && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(candidate)
     } else {
         None
     }
@@ -632,7 +658,7 @@ mod tests {
     fn parse_sha1_hash_only() {
         let content = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         assert_eq!(
-            parse_sha1_checksum(content),
+            parse_hex_checksum(content, 40),
             Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string())
         );
     }
@@ -641,7 +667,7 @@ mod tests {
     fn parse_sha1_with_filename() {
         let content = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  commons-lang3-3.12.0.jar";
         assert_eq!(
-            parse_sha1_checksum(content),
+            parse_hex_checksum(content, 40),
             Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string())
         );
     }
@@ -650,7 +676,7 @@ mod tests {
     fn parse_sha1_with_trailing_whitespace() {
         let content = "  a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  \n";
         assert_eq!(
-            parse_sha1_checksum(content),
+            parse_hex_checksum(content, 40),
             Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string())
         );
     }
@@ -659,27 +685,45 @@ mod tests {
     fn parse_sha1_uppercase_normalized() {
         let content = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
         assert_eq!(
-            parse_sha1_checksum(content),
+            parse_hex_checksum(content, 40),
             Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string())
         );
     }
 
     #[test]
     fn parse_sha1_empty_returns_none() {
-        assert_eq!(parse_sha1_checksum(""), None);
-        assert_eq!(parse_sha1_checksum("   "), None);
+        assert_eq!(parse_hex_checksum("", 40), None);
+        assert_eq!(parse_hex_checksum("   ", 40), None);
     }
 
     #[test]
     fn parse_sha1_invalid_length_returns_none() {
-        assert_eq!(parse_sha1_checksum("abc123"), None);
+        assert_eq!(parse_hex_checksum("abc123", 40), None);
     }
 
     #[test]
     fn parse_sha1_non_hex_returns_none() {
         assert_eq!(
-            parse_sha1_checksum("g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            parse_hex_checksum("g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 40),
             None
+        );
+    }
+
+    #[test]
+    fn parse_sha256_hash_only() {
+        let input = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            parse_hex_checksum(input, 64),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sha256_with_filename() {
+        let input = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  artifact.jar";
+        assert_eq!(
+            parse_hex_checksum(input, 64),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
         );
     }
 

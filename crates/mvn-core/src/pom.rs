@@ -41,9 +41,9 @@ pub struct Pom {
     pub dependencies: Dependencies,
     #[serde(default)]
     pub repositories: Repositories,
+    #[serde(rename = "distributionManagement", default)]
+    pub distribution_management: Option<DistributionManagement>,
 }
-
-/// Parent POM reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Parent {
     #[serde(rename = "groupId")]
@@ -95,6 +95,26 @@ pub struct PomRepository {
     pub name: Option<String>,
     #[serde(default)]
     pub layout: Option<String>,
+}
+
+/// Distribution management section (for relocation support).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DistributionManagement {
+    #[serde(default)]
+    pub relocation: Option<Relocation>,
+}
+
+/// Artifact relocation information.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Relocation {
+    #[serde(rename = "groupId", default)]
+    pub group_id: Option<String>,
+    #[serde(rename = "artifactId", default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Dependency management section of a POM.
@@ -361,6 +381,19 @@ pub fn interpolate_pom(pom: &mut Pom) {
         .entry("project.packaging".into())
         .or_insert_with(|| pom.effective_packaging().to_string());
 
+    // Populate env.* properties from environment variables
+    for (key, value) in std::env::vars() {
+        props.entry(format!("env.{key}")).or_insert(value);
+    }
+
+    // Populate common built-in properties
+    props.entry("java.version".into())
+        .or_insert_with(|| std::env::var("JAVA_VERSION").unwrap_or_default());
+    props.entry("os.name".into())
+        .or_insert_with(|| std::env::consts::OS.to_string());
+    props.entry("os.arch".into())
+        .or_insert_with(|| std::env::consts::ARCH.to_string());
+
     // Interpolate property values themselves (handles cross-references)
     let keys: Vec<String> = props.keys().cloned().collect();
     for key in &keys {
@@ -388,6 +421,9 @@ pub fn interpolate_pom(pom: &mut Pom) {
     if let Some(ref mut v) = pom.url {
         *v = interpolate(v, &props);
     }
+
+    // Write interpolated properties back to pom
+    pom.properties.entries = props.clone();
 
     // Interpolate dependencies
     for dep in &mut pom.dependencies.dependency {
@@ -1152,5 +1188,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pom.effective_packaging(), "war");
+    }
+
+    #[test]
+    fn parse_pom_with_relocation() {
+        let xml = r#"
+        <project>
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.old</groupId>
+            <artifactId>old-lib</artifactId>
+            <version>1.0</version>
+            <distributionManagement>
+                <relocation>
+                    <groupId>org.new</groupId>
+                    <artifactId>new-lib</artifactId>
+                    <version>2.0</version>
+                    <message>Moved to org.new</message>
+                </relocation>
+            </distributionManagement>
+        </project>"#;
+
+        let pom = parse_pom(xml).unwrap();
+        let dm = pom.distribution_management.unwrap();
+        let reloc = dm.relocation.unwrap();
+        assert_eq!(reloc.group_id.as_deref(), Some("org.new"));
+        assert_eq!(reloc.artifact_id.as_deref(), Some("new-lib"));
+        assert_eq!(reloc.version.as_deref(), Some("2.0"));
+        assert_eq!(reloc.message.as_deref(), Some("Moved to org.new"));
+    }
+
+    #[test]
+    fn interpolate_env_properties() {
+        // Set a test env var
+        std::env::set_var("MVN_RS_TEST_PROP", "test_value");
+        let xml = r#"
+        <project>
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.example</groupId>
+            <artifactId>app</artifactId>
+            <version>1.0</version>
+            <properties>
+                <my.os>${os.name}</my.os>
+            </properties>
+        </project>"#;
+
+        let mut pom = parse_pom(xml).unwrap();
+        interpolate_pom(&mut pom);
+        // os.name should be populated
+        let os_prop = pom.properties.entries.get("my.os").unwrap();
+        assert!(!os_prop.contains("${"), "os.name should be interpolated, got: {os_prop}");
+        std::env::remove_var("MVN_RS_TEST_PROP");
     }
 }
