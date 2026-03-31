@@ -615,15 +615,15 @@ pub fn inject_dependency_management(pom: &mut Pom) {
             if dep.scope.is_none() {
                 dep.scope = managed_dep.scope.clone();
             }
-            for exc in &managed_dep.exclusions.exclusion {
-                let exists = dep
-                    .exclusions
-                    .exclusion
-                    .iter()
-                    .any(|e| e.group_id == exc.group_id && e.artifact_id == exc.artifact_id);
-                if !exists {
-                    dep.exclusions.exclusion.push(exc.clone());
-                }
+            if dep.dep_type.is_none() {
+                dep.dep_type = managed_dep.dep_type.clone();
+            }
+            if dep.classifier.is_none() {
+                dep.classifier = managed_dep.classifier.clone();
+            }
+            // Java Maven: DM exclusions only applied if dep has NONE
+            if dep.exclusions.exclusion.is_empty() {
+                dep.exclusions = managed_dep.exclusions.clone();
             }
         }
     }

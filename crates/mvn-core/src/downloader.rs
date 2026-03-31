@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 
 use crate::coord::ArtifactCoord;
 use crate::error::{MvnError, Result};
-use crate::metadata::{parse_metadata, MavenMetadata};
+use crate::metadata::{merge_metadata, parse_metadata, MavenMetadata};
 use crate::pom::{parse_pom, Pom};
 use crate::repository::RepositorySystem;
 use crate::settings::Settings;
@@ -127,7 +127,10 @@ impl ArtifactDownloader {
         retry_config: RetryConfig,
         proxy: Option<&crate::settings::Proxy>,
     ) -> Self {
-        let mut builder = Client::builder().user_agent("mvn-rs/0.1");
+        let mut builder = Client::builder()
+            .user_agent("mvn-rs/0.1")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300));
 
         // Configure proxy if provided
         if let Some(proxy_cfg) = proxy {
@@ -582,22 +585,34 @@ impl ArtifactDownloader {
 
     /// Fetch `maven-metadata.xml` for a groupId:artifactId.
     ///
-    /// Tries each remote repository and returns the first successful result.
+    /// Tries each remote repository and **merges** version lists from all
+    /// successful results, matching Java Maven's metadata merge behaviour.
     pub async fn fetch_metadata(
         &self,
         group_id: &str,
         artifact_id: &str,
     ) -> Result<MavenMetadata> {
+        let mut merged: Option<MavenMetadata> = None;
         let mut last_err: Option<MvnError> = None;
+
         for remote in self.repo_system.remotes() {
             let url = remote.metadata_url(group_id, artifact_id);
             let creds = remote.credentials();
             tracing::debug!("fetching metadata from {}", url);
 
             match self.fetch_text(&url, creds).await {
-                Ok(Some(text)) => {
-                    return parse_metadata(&text);
-                }
+                Ok(Some(text)) => match parse_metadata(&text) {
+                    Ok(meta) => {
+                        merged = Some(match merged {
+                            Some(existing) => merge_metadata(existing, meta),
+                            None => meta,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!("failed to parse metadata from {}: {}", remote.id, e);
+                        last_err = Some(e);
+                    }
+                },
                 Ok(None) => {
                     tracing::debug!(
                         "metadata for {}:{} not found in {}",
@@ -605,7 +620,6 @@ impl ArtifactDownloader {
                         artifact_id,
                         remote.id
                     );
-                    continue;
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -616,14 +630,15 @@ impl ArtifactDownloader {
                         e
                     );
                     last_err = Some(e);
-                    continue;
                 }
             }
         }
 
-        Err(last_err.unwrap_or(MvnError::ArtifactNotFound {
-            coord: format!("{}:{}", group_id, artifact_id),
-        }))
+        merged.ok_or_else(|| {
+            last_err.unwrap_or(MvnError::ArtifactNotFound {
+                coord: format!("{}:{}", group_id, artifact_id),
+            })
+        })
     }
 
     // -- Batch / concurrent API ---------------------------------------------

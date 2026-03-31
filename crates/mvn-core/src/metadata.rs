@@ -79,6 +79,43 @@ impl MavenMetadata {
     }
 }
 
+/// Merge two metadata objects, combining version lists and keeping the
+/// latest `release`/`latest`/`lastUpdated` values. Matches Java Maven's
+/// metadata merge from multiple repositories.
+pub fn merge_metadata(mut base: MavenMetadata, other: MavenMetadata) -> MavenMetadata {
+    match (&mut base.versioning, other.versioning) {
+        (Some(bv), Some(ov)) => {
+            // Merge version lists (union, deduplicated)
+            let mut seen: std::collections::HashSet<String> =
+                bv.versions.version.iter().cloned().collect();
+            for v in ov.versions.version {
+                if seen.insert(v.clone()) {
+                    bv.versions.version.push(v);
+                }
+            }
+            // Keep the latest `release` and `latest` by lastUpdated timestamp
+            if ov.last_updated > bv.last_updated {
+                if ov.release.is_some() {
+                    bv.release = ov.release;
+                }
+                if ov.latest.is_some() {
+                    bv.latest = ov.latest;
+                }
+                bv.last_updated = ov.last_updated;
+            }
+            // Keep snapshot from the newer metadata
+            if ov.snapshot.is_some() && bv.snapshot.is_none() {
+                bv.snapshot = ov.snapshot;
+            }
+        }
+        (None, some) => {
+            base.versioning = some;
+        }
+        _ => {}
+    }
+    base
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -241,5 +278,71 @@ mod tests {
         assert_eq!(avail.len(), 100);
         assert_eq!(avail[0], "1.1");
         assert_eq!(avail[99], "1.100");
+    }
+
+    #[test]
+    fn merge_metadata_combines_versions() {
+        let base = MavenMetadata {
+            group_id: Some("org.example".into()),
+            artifact_id: Some("lib".into()),
+            version: None,
+            versioning: Some(Versioning {
+                latest: Some("1.2".into()),
+                release: Some("1.2".into()),
+                versions: Versions {
+                    version: vec!["1.0".into(), "1.1".into(), "1.2".into()],
+                },
+                last_updated: Some("20240101000000".into()),
+                snapshot: None,
+            }),
+        };
+        let other = MavenMetadata {
+            group_id: Some("org.example".into()),
+            artifact_id: Some("lib".into()),
+            version: None,
+            versioning: Some(Versioning {
+                latest: Some("1.4".into()),
+                release: Some("1.4".into()),
+                versions: Versions {
+                    version: vec!["1.2".into(), "1.3".into(), "1.4".into()],
+                },
+                last_updated: Some("20240601000000".into()),
+                snapshot: None,
+            }),
+        };
+
+        let merged = merge_metadata(base, other);
+        let versions = merged.available_versions();
+        assert_eq!(versions.len(), 5); // 1.0, 1.1, 1.2, 1.3, 1.4 (deduplicated)
+        assert!(versions.contains(&"1.0"));
+        assert!(versions.contains(&"1.4"));
+        assert_eq!(merged.latest_release(), Some("1.4")); // newer wins
+    }
+
+    #[test]
+    fn merge_metadata_base_only() {
+        let base = MavenMetadata {
+            group_id: Some("org.example".into()),
+            artifact_id: Some("lib".into()),
+            version: None,
+            versioning: Some(Versioning {
+                latest: Some("1.0".into()),
+                release: Some("1.0".into()),
+                versions: Versions {
+                    version: vec!["1.0".into()],
+                },
+                last_updated: Some("20240101000000".into()),
+                snapshot: None,
+            }),
+        };
+        let other = MavenMetadata {
+            group_id: None,
+            artifact_id: None,
+            version: None,
+            versioning: None,
+        };
+
+        let merged = merge_metadata(base, other);
+        assert_eq!(merged.available_versions().len(), 1);
     }
 }
