@@ -1,16 +1,83 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table};
+use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::sync::Semaphore;
 
 use mvn_core::coord::{ArtifactCoord, DependencyScope};
 use mvn_core::downloader::{ArtifactDownloader, RetryConfig};
-use mvn_core::resolver::{format_tree, DependencyResolver};
+use mvn_core::resolver::{format_tree, DependencyNode, DependencyResolver};
 use mvn_core::settings;
+
+// ---------------------------------------------------------------------------
+// Shared tree helpers
+// ---------------------------------------------------------------------------
+
+/// Maximum concurrent artifact downloads.
+const MAX_DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// A flattened tree line with prefix, coordinate, and scope for display.
+struct TreeLine {
+    prefix: String,
+    coord: ArtifactCoord,
+    scope: DependencyScope,
+}
+
+/// Walk the dependency tree depth-first, collecting display lines with
+/// proper tree prefixes (├──, └──, │, etc.).
+fn collect_tree_lines(nodes: &[DependencyNode], prefix: &str, lines: &mut Vec<TreeLine>) {
+    let len = nodes.len();
+    for (i, node) in nodes.iter().enumerate() {
+        let is_last = i + 1 == len;
+        let connector = if is_last { "└── " } else { "├── " };
+        let child_prefix = format!(
+            "{}{}",
+            prefix,
+            if is_last { "    " } else { "│   " }
+        );
+
+        lines.push(TreeLine {
+            prefix: format!("{prefix}{connector}"),
+            coord: node.coord.clone(),
+            scope: node.scope,
+        });
+
+        collect_tree_lines(&node.children, &child_prefix, lines);
+    }
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Resolve dependencies (shared between `deps` and `download` commands).
+async fn resolve_deps(
+    downloader: &ArtifactDownloader,
+    coord: &ArtifactCoord,
+    scope_filter: Option<DependencyScope>,
+) -> Result<mvn_core::resolver::ResolutionResult> {
+    let resolver = DependencyResolver::new(downloader);
+    resolver
+        .resolve_no_download(coord, scope_filter)
+        .await
+        .context("dependency resolution failed")
+}
 
 #[derive(Parser)]
 #[command(name = "mvn-rs", version, about = "Maven dependency resolver and downloader in Rust")]
@@ -190,11 +257,7 @@ async fn cmd_deps(
     let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
 
     let pb = spinner("Resolving dependencies...");
-    let resolver = DependencyResolver::new(downloader);
-    let result = resolver
-        .resolve(&coord, scope_filter)
-        .await
-        .context("dependency resolution failed")?;
+    let result = resolve_deps(downloader, &coord, scope_filter).await?;
     pb.finish_and_clear();
 
     if tree {
@@ -246,53 +309,8 @@ async fn cmd_download(
 ) -> Result<()> {
     let coord = parse_coord(coord_str).context("invalid coordinates")?;
 
-    let mut downloaded_paths: Vec<PathBuf> = Vec::new();
-
-    if !no_deps {
-        let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
-
-        let pb = spinner("Resolving dependencies...");
-        let resolver = DependencyResolver::new(downloader);
-        let result = resolver
-            .resolve(&coord, scope_filter)
-            .await
-            .context("dependency resolution failed")?;
-        pb.finish_and_clear();
-
-        // Collect already-downloaded dependency paths
-        for dep in &result.dependencies {
-            if let Some(path) = &dep.path {
-                downloaded_paths.push(path.clone());
-            }
-        }
-
-        // Download root artifact with progress
-        let multi = MultiProgress::new();
-        let main_pb = multi.add(ProgressBar::new(1));
-        main_pb.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        main_pb.set_message(format!("⬇️  Downloading {coord}..."));
-        main_pb.enable_steady_tick(std::time::Duration::from_millis(80));
-        match downloader.download_artifact(&coord).await {
-            Ok(path) => {
-                main_pb.finish_and_clear();
-                downloaded_paths.push(path);
-            }
-            Err(e) => {
-                main_pb.finish_and_clear();
-                eprintln!("{}", format!("Warning: could not download root artifact: {e}").yellow());
-            }
-        }
-
-        println!(
-            "{}",
-            format!("✅ Downloaded {} artifacts", downloaded_paths.len())
-                .green()
-                .bold()
-        );
-    } else {
+    // Simple single-artifact download (--no-deps)
+    if no_deps {
         let pb = spinner(&format!("⬇️  Downloading {coord}..."));
         let path = downloader
             .download_artifact(&coord)
@@ -300,42 +318,220 @@ async fn cmd_download(
             .context("failed to download artifact")?;
         pb.finish_and_clear();
         println!("{}", "✅ Download complete".green().bold());
-        downloaded_paths.push(path);
+        maybe_copy_files(&[path.clone()], output)?;
+        if output.is_none() {
+            println!("  {}", path.display());
+        }
+        println!();
+        return Ok(());
     }
 
-    if let Some(output_dir) = output {
-        let dest = Path::new(output_dir);
-        std::fs::create_dir_all(dest)
-            .with_context(|| format!("failed to create output directory '{output_dir}'"))?;
+    // ----- Full dependency download with live tree display -----
 
-        let copy_pb = ProgressBar::new(downloaded_paths.len() as u64);
-        copy_pb.set_style(
-            ProgressStyle::with_template("  [{bar:30.cyan/dim}] {pos}/{len} copied")
-                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
+
+    // Phase 1: Resolve dependencies
+    let pb = spinner("Resolving dependencies...");
+    let result = resolve_deps(downloader, &coord, scope_filter).await?;
+    pb.finish_and_clear();
+
+    // Collect downloadable artifacts (skip pom-packaging)
+    let download_coords: Vec<ArtifactCoord> = result
+        .dependencies
+        .iter()
+        .filter(|d| d.coord.extension != "pom")
+        .map(|d| d.coord.clone())
+        .collect();
+
+    // Include root artifact
+    let mut all_coords = vec![coord.clone()];
+    all_coords.extend(download_coords);
+    let total = all_coords.len();
+
+    // Phase 2: Build the live tree display
+    let mp = MultiProgress::new();
+
+    // Header line
+    let header_style =
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
+    let header = mp.add(ProgressBar::new(0));
+    header.set_style(header_style.clone());
+    header.set_message(format!(
+        "\n{}  {}",
+        "📦".to_string(),
+        format!("{coord}  ({} dependencies)", result.dependencies.len()).bold().to_string(),
+    ));
+    header.finish();
+
+    // Collect tree lines and create bars
+    let mut lines = Vec::new();
+    collect_tree_lines(&result.tree, "", &mut lines);
+
+    let line_style =
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
+
+    // Map: coord_string → (ProgressBar, prefix, scope)
+    struct LiveBar {
+        pb: ProgressBar,
+        prefix: String,
+        scope: DependencyScope,
+    }
+
+    let mut bar_map: HashMap<String, LiveBar> = HashMap::new();
+
+    for line in &lines {
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(line_style.clone());
+        pb.set_message(format!(
+            "{}{} {} {}",
+            line.prefix.dimmed(),
+            line.coord,
+            colored_scope_str(&line.scope),
+            "⏳".dimmed(),
+        ));
+        pb.finish();
+
+        bar_map.insert(
+            line.coord.to_string(),
+            LiveBar {
+                pb,
+                prefix: line.prefix.clone(),
+                scope: line.scope,
+            },
         );
+    }
 
-        for src in &downloaded_paths {
-            if let Some(file_name) = src.file_name() {
-                let dst = dest.join(file_name);
-                std::fs::copy(src, &dst).with_context(|| {
-                    format!("failed to copy {} to {}", src.display(), dst.display())
-                })?;
+    // Summary / progress bar at the bottom
+    let summary_style = ProgressStyle::with_template(
+        "\n  {msg} [{bar:35.cyan/dim}] {pos}/{len} artifacts",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar());
+    let summary = mp.add(ProgressBar::new(total as u64));
+    summary.set_style(summary_style);
+    summary.set_message("⬇️  Downloading");
+
+    // Phase 3: Download concurrently, updating bars in real-time
+    let semaphore = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+    let bar_map = Arc::new(bar_map);
+
+    let mut futures = FuturesUnordered::new();
+
+    for dl_coord in all_coords {
+        let sem = semaphore.clone();
+        let bars = bar_map.clone();
+
+        futures.push(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+
+            // Update bar → downloading
+            let key = dl_coord.to_string();
+            if let Some(bar) = bars.get(&key) {
+                bar.pb.set_message(format!(
+                    "{}{} {} {}",
+                    bar.prefix.dimmed(),
+                    dl_coord.to_string().cyan(),
+                    colored_scope_str(&bar.scope),
+                    "⬇️ ",
+                ));
             }
-            copy_pb.inc(1);
-        }
-        copy_pb.finish_and_clear();
-        println!(
-            "{}",
-            format!("✅ Copied {} files to {}", downloaded_paths.len(), dest.display())
-                .green()
-        );
-    } else {
-        for p in &downloaded_paths {
-            println!("  {}", p.display());
+
+            let result = downloader.download_artifact(&dl_coord).await;
+
+            // Update bar → done / failed
+            if let Some(bar) = bars.get(&key) {
+                match &result {
+                    Ok(path) => {
+                        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        bar.pb.set_message(format!(
+                            "{}{} {} {} {}",
+                            bar.prefix.dimmed(),
+                            dl_coord.to_string().green(),
+                            colored_scope_str(&bar.scope),
+                            "✅".to_string(),
+                            format_bytes(size).dimmed(),
+                        ));
+                    }
+                    Err(_) => {
+                        bar.pb.set_message(format!(
+                            "{}{} {} {}",
+                            bar.prefix.dimmed(),
+                            dl_coord.to_string().red(),
+                            colored_scope_str(&bar.scope),
+                            "❌".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            (dl_coord, result)
+        });
+    }
+
+    let mut downloaded_paths: Vec<PathBuf> = Vec::new();
+    let mut failed = 0usize;
+
+    while let Some((dl_coord, result)) = futures.next().await {
+        summary.inc(1);
+        match result {
+            Ok(path) => downloaded_paths.push(path),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("failed to download {}: {}", dl_coord, e);
+            }
         }
     }
+
+    summary.finish_with_message(if failed > 0 {
+        format!(
+            "✅ Downloaded {} artifacts ({} failed)",
+            downloaded_paths.len(),
+            failed
+        )
+    } else {
+        format!("✅ Downloaded {} artifacts", downloaded_paths.len())
+    });
+
+    // Phase 4: Copy to output directory if requested
+    maybe_copy_files(&downloaded_paths, output)?;
 
     println!();
+    Ok(())
+}
+
+/// Copy downloaded files to an output directory if specified.
+fn maybe_copy_files(paths: &[PathBuf], output: Option<&str>) -> Result<()> {
+    let Some(output_dir) = output else {
+        return Ok(());
+    };
+    let dest = Path::new(output_dir);
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create output directory '{output_dir}'"))?;
+
+    let copy_pb = ProgressBar::new(paths.len() as u64);
+    copy_pb.set_style(
+        ProgressStyle::with_template("  [{bar:30.cyan/dim}] {pos}/{len} copied")
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+
+    for src in paths {
+        if let Some(file_name) = src.file_name() {
+            let dst = dest.join(file_name);
+            std::fs::copy(src, &dst).with_context(|| {
+                format!("failed to copy {} to {}", src.display(), dst.display())
+            })?;
+        }
+        copy_pb.inc(1);
+    }
+    copy_pb.finish_and_clear();
+    println!(
+        "{}",
+        format!(
+            "  📁 Copied {} files to {}",
+            paths.len(),
+            dest.display()
+        )
+        .green()
+    );
     Ok(())
 }
 

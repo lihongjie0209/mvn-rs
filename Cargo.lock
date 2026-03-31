@@ -913,6 +913,7 @@ dependencies = [
  "clap",
  "colored",
  "comfy-table",
+ "futures",
  "indicatif",
  "mvn-core",
  "tokio",
