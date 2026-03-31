@@ -123,7 +123,15 @@ impl LocalRepository {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, data)?;
+        // Atomic write: write to temp file then rename to avoid race conditions
+        // when multiple concurrent downloads target the same artifact.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, data)?;
+        if std::fs::rename(&tmp_path, &path).is_err() {
+            // rename can fail across filesystems; fall back to direct write
+            let _ = std::fs::remove_file(&tmp_path);
+            std::fs::write(&path, data)?;
+        }
         Ok(path)
     }
 

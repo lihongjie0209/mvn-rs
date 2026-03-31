@@ -286,15 +286,16 @@ impl<'a> DependencyResolver<'a> {
             .await
     }
 
-    /// Build a `(groupId, artifactId) → PomDependency` map from a POM's
-    /// `<dependencyManagement>` section.
-    fn build_managed_map(pom: &pom::Pom) -> HashMap<(String, String), pom::PomDependency> {
+    /// Build a `(groupId, artifactId, type) → PomDependency` map from a POM's
+    /// `<dependencyManagement>` section. The key includes `type` (defaulting to
+    /// `"jar"`) to match Maven's `Dependency.getManagementKey()`.
+    fn build_managed_map(pom: &pom::Pom) -> HashMap<(String, String, String), pom::PomDependency> {
         match &pom.dependency_management {
             Some(dm) => dm
                 .dependencies
                 .dependency
                 .iter()
-                .map(|d| ((d.group_id.clone(), d.artifact_id.clone()), d.clone()))
+                .map(|d| (pom::dm_key(d), d.clone()))
                 .collect(),
             None => HashMap::new(),
         }
@@ -314,7 +315,7 @@ impl<'a> DependencyResolver<'a> {
         parent_exclusions: Vec<Exclusion>,
         visited: Arc<Mutex<HashSet<(String, String)>>>,
         depth: usize,
-        root_managed: Arc<HashMap<(String, String), pom::PomDependency>>,
+        root_managed: Arc<HashMap<(String, String, String), pom::PomDependency>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyNode>>> + Send + '_>> {
         Box::pin(async move {
             if depth >= MAX_DEPTH {
@@ -360,10 +361,37 @@ impl<'a> DependencyResolver<'a> {
                 // version for this GA, use it instead of whatever the current
                 // POM declares. This is the key Maven behaviour that ensures
                 // the top-level project controls transitive versions.
-                let root_key = (dep.group_id.clone(), dep.artifact_id.clone());
+                let root_key = (
+                    dep.group_id.clone(),
+                    dep.artifact_id.clone(),
+                    dep.dep_type.as_deref().unwrap_or("jar").to_string(),
+                );
                 let version = if let Some(managed) = root_managed.get(&root_key) {
-                    // Root DM wins
-                    managed.version.clone().unwrap_or_default()
+                    // Root DM wins — but if DM entry has no version, fall back
+                    // to the dependency's declared version.
+                    match &managed.version {
+                        Some(mv) if !mv.is_empty() && !mv.contains("${") => mv.clone(),
+                        _ => {
+                            // DM has no usable version, fall back to dep's own
+                            match &dep.version {
+                                Some(v) if !v.is_empty() && !v.contains("${") => v.clone(),
+                                Some(v) if !v.is_empty() => {
+                                    warn!(
+                                        "skipping {}:{} — unresolved version: {}",
+                                        dep.group_id, dep.artifact_id, v
+                                    );
+                                    continue;
+                                }
+                                _ => {
+                                    warn!(
+                                        "skipping {}:{} — no version specified",
+                                        dep.group_id, dep.artifact_id
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 } else {
                     match &dep.version {
                         Some(v) if !v.is_empty() && !v.contains("${") => v.clone(),
@@ -508,57 +536,58 @@ impl<'a> DependencyResolver<'a> {
                             let mut child_pom = raw_pom;
                             self.prepare_pom(&mut child_pom, 0).await;
 
-                            // Check for POM relocation
-                            if let Some(relocated) =
-                                Self::check_relocation(&child_pom, &info.coord)
-                            {
-                                warn!(
-                                    "artifact {} relocated to {}",
-                                    info.coord, relocated
-                                );
-                                match self.fetch_and_prepare_pom(&relocated).await {
-                                    Ok(relocated_pom) => {
-                                        self.collect_children(
-                                            relocated_pom,
-                                            info.child_exclusions,
-                                            visited,
-                                            depth + 1,
-                                            root_managed,
-                                        )
-                                        .await
-                                        .unwrap_or_else(|e| {
+                            // Follow relocation chain (A→B→C) with cycle detection
+                            let mut current_coord = info.coord.clone();
+                            let mut current_pom = child_pom;
+                            let mut relocation_seen = std::collections::HashSet::new();
+                            loop {
+                                if let Some(relocated) =
+                                    Self::check_relocation(&current_pom, &current_coord)
+                                {
+                                    if !relocation_seen.insert(relocated.to_string()) {
+                                        warn!("relocation cycle detected at {}", relocated);
+                                        break;
+                                    }
+                                    warn!(
+                                        "artifact {} relocated to {}",
+                                        current_coord, relocated
+                                    );
+                                    match self.fetch_and_prepare_pom(&relocated).await {
+                                        Ok(relocated_pom) => {
+                                            current_coord = relocated;
+                                            current_pom = relocated_pom;
+                                            // Continue loop to check if the relocated POM
+                                            // itself has another relocation
+                                        }
+                                        Err(e) => {
                                             warn!(
-                                                "failed collecting deps for relocated {}: {e}",
+                                                "failed to fetch relocated POM {}: {e}",
                                                 relocated
                                             );
-                                            Vec::new()
-                                        })
+                                            current_pom = current_pom; // use last known POM
+                                            break;
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(
-                                            "failed to fetch relocated POM {}: {e}",
-                                            relocated
-                                        );
-                                        Vec::new()
-                                    }
+                                } else {
+                                    break;
                                 }
-                            } else {
-                                self.collect_children(
-                                    child_pom,
-                                    info.child_exclusions,
-                                    visited,
-                                    depth + 1,
-                                    root_managed,
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    warn!(
-                                        "failed to collect transitive deps for {}: {e}",
-                                        info.coord
-                                    );
-                                    Vec::new()
-                                })
                             }
+
+                            self.collect_children(
+                                current_pom,
+                                info.child_exclusions,
+                                visited,
+                                depth + 1,
+                                root_managed,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    "failed collecting deps for {}: {e}",
+                                    current_coord
+                                );
+                                Vec::new()
+                            })
                         }
                         Some(Err(e)) => {
                             warn!("failed to fetch POM for {}: {e}", info.coord);
@@ -674,6 +703,10 @@ impl<'a> DependencyResolver<'a> {
         let mut matching: Vec<(&str, Version)> = version_strs
             .into_iter()
             .filter_map(|v| {
+                // Maven excludes SNAPSHOT versions from range resolution
+                if v.ends_with("-SNAPSHOT") {
+                    return None;
+                }
                 let parsed = Version::new(v);
                 if constraint.contains(&parsed) {
                     Some((v, parsed))
@@ -892,11 +925,11 @@ impl<'a> DependencyResolver<'a> {
                                     }
                                 });
 
-                            let existing_keys: HashSet<(String, String)> = child_dm
+                            let existing_keys: HashSet<(String, String, String)> = child_dm
                                 .dependencies
                                 .dependency
                                 .iter()
-                                .map(|d| (d.group_id.clone(), d.artifact_id.clone()))
+                                .map(|d| pom::dm_key(d))
                                 .collect();
 
                             // BOM import exclusions filter imported entries
@@ -908,8 +941,7 @@ impl<'a> DependencyResolver<'a> {
                                 .collect();
 
                             for dep in &bom_dm.dependencies.dependency {
-                                let key =
-                                    (dep.group_id.clone(), dep.artifact_id.clone());
+                                let key = pom::dm_key(dep);
                                 if existing_keys.contains(&key) {
                                     continue;
                                 }
@@ -2203,7 +2235,7 @@ mod tests {
 
         let map = DependencyResolver::build_managed_map(&pom);
         assert_eq!(map.len(), 1);
-        let entry = map.get(&("com.example".into(), "lib".into())).unwrap();
+        let entry = map.get(&("com.example".into(), "lib".into(), "jar".into())).unwrap();
         assert_eq!(entry.version, Some("3.0".into()));
     }
 
@@ -2363,5 +2395,78 @@ mod tests {
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].coord.version, "8.0",
             "property from grandparent should be inherited through chain");
+    }
+
+    // ---- Tests for audit fixes ----
+
+    #[test]
+    fn snapshot_excluded_from_version_range() {
+        // Version ranges should not include SNAPSHOT versions
+        use crate::version::{Version, VersionConstraint};
+        let constraint = VersionConstraint::parse("[1.0,2.0)").unwrap();
+        let versions = vec!["1.0", "1.5", "1.9-SNAPSHOT", "2.0-SNAPSHOT"];
+        let mut matching: Vec<(&str, Version)> = versions
+            .into_iter()
+            .filter_map(|v| {
+                if v.ends_with("-SNAPSHOT") {
+                    return None;
+                }
+                let parsed = Version::new(v);
+                if constraint.contains(&parsed) {
+                    Some((v, parsed))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matching.sort_by(|a, b| b.1.cmp(&a.1));
+        let best = matching.first().map(|(s, _)| *s);
+        assert_eq!(best, Some("1.5"), "SNAPSHOT versions should be excluded from ranges");
+    }
+
+    #[test]
+    fn build_managed_map_includes_type() {
+        let pom = pom::Pom {
+            model_version: None,
+            group_id: Some("org".into()),
+            artifact_id: Some("root".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: Some(pom::DependencyManagement {
+                dependencies: pom::Dependencies {
+                    dependency: vec![
+                        pom::PomDependency {
+                            group_id: "com.example".into(),
+                            artifact_id: "lib".into(),
+                            version: Some("1.0".into()),
+                            dep_type: None,
+                            ..Default::default()
+                        },
+                        pom::PomDependency {
+                            group_id: "com.example".into(),
+                            artifact_id: "lib".into(),
+                            version: Some("2.0".into()),
+                            dep_type: Some("test-jar".into()),
+                            ..Default::default()
+                        },
+                    ],
+                },
+            }),
+            dependencies: Default::default(),
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        let map = DependencyResolver::build_managed_map(&pom);
+        assert_eq!(map.len(), 2, "same GA with different types should produce 2 entries");
+        let jar = map.get(&("com.example".into(), "lib".into(), "jar".into())).unwrap();
+        assert_eq!(jar.version, Some("1.0".into()));
+        let test_jar = map.get(&("com.example".into(), "lib".into(), "test-jar".into())).unwrap();
+        assert_eq!(test_jar.version, Some("2.0".into()));
     }
 }

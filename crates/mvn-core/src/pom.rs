@@ -56,7 +56,7 @@ pub struct Parent {
 }
 
 /// A dependency declared in a POM.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PomDependency {
     #[serde(rename = "groupId")]
     pub group_id: String,
@@ -466,6 +466,14 @@ pub fn interpolate_pom(pom: &mut Pom) {
             interpolate_dep(dep, &props);
         }
     }
+
+    // Interpolate repository URLs and names
+    for repo in &mut pom.repositories.repository {
+        repo.url = interpolate(&repo.url, &props);
+        if let Some(ref mut name) = repo.name {
+            *name = interpolate(name, &props);
+        }
+    }
 }
 
 fn interpolate_dep(dep: &mut PomDependency, props: &HashMap<String, String>) {
@@ -483,6 +491,11 @@ fn interpolate_dep(dep: &mut PomDependency, props: &HashMap<String, String>) {
     if let Some(ref mut v) = dep.dep_type {
         *v = interpolate(v, props);
     }
+    // Interpolate exclusion groupId/artifactId (Maven does this)
+    for exc in &mut dep.exclusions.exclusion {
+        exc.group_id = interpolate(&exc.group_id, props);
+        exc.artifact_id = interpolate(&exc.artifact_id, props);
+    }
 }
 
 // ============================================================================
@@ -492,7 +505,7 @@ fn interpolate_dep(dep: &mut PomDependency, props: &HashMap<String, String>) {
 /// Merge parent POM fields into child POM.
 ///
 /// Parent values are used as defaults — child values take priority.
-/// Dependencies are NOT inherited (only dependencyManagement is).
+/// Both `<dependencyManagement>` and `<dependencies>` are inherited.
 pub fn merge_parent(child: &mut Pom, parent: &Pom) {
     if child.group_id.is_none() {
         child.group_id = parent.group_id.clone();
@@ -517,7 +530,7 @@ pub fn merge_parent(child: &mut Pom, parent: &Pom) {
     }
     child.properties.entries = merged;
 
-    // DependencyManagement: parent entries added; child overrides by (groupId, artifactId)
+    // DependencyManagement: parent entries added; child overrides by (groupId, artifactId, type)
     if let Some(parent_dm) = &parent.dependency_management {
         let child_dm = child
             .dependency_management
@@ -525,15 +538,15 @@ pub fn merge_parent(child: &mut Pom, parent: &Pom) {
                 dependencies: Dependencies::default(),
             });
 
-        let child_keys: std::collections::HashSet<(String, String)> = child_dm
+        let child_keys: std::collections::HashSet<(String, String, String)> = child_dm
             .dependencies
             .dependency
             .iter()
-            .map(|d| (d.group_id.clone(), d.artifact_id.clone()))
+            .map(|d| dm_key(d))
             .collect();
 
         for dep in &parent_dm.dependencies.dependency {
-            let key = (dep.group_id.clone(), dep.artifact_id.clone());
+            let key = dm_key(dep);
             if !child_keys.contains(&key) {
                 child_dm.dependencies.dependency.push(dep.clone());
             }
@@ -545,26 +558,56 @@ pub fn merge_parent(child: &mut Pom, parent: &Pom) {
         .repositories
         .repository
         .extend(parent.repositories.repository.clone());
+
+    // Dependencies: parent entries added; child overrides by (groupId, artifactId)
+    let child_dep_keys: std::collections::HashSet<(String, String)> = child
+        .dependencies
+        .dependency
+        .iter()
+        .map(|d| (d.group_id.clone(), d.artifact_id.clone()))
+        .collect();
+
+    for dep in &parent.dependencies.dependency {
+        let key = (dep.group_id.clone(), dep.artifact_id.clone());
+        if !child_dep_keys.contains(&key) {
+            child.dependencies.dependency.push(dep.clone());
+        }
+    }
 }
 
 // ============================================================================
 // DependencyManagement Injection
 // ============================================================================
 
+/// Build the DM management key: `(groupId, artifactId, type)`.
+/// Maven matches DM entries by `groupId:artifactId:type` where type defaults
+/// to `"jar"` if not specified.
+pub fn dm_key(d: &PomDependency) -> (String, String, String) {
+    (
+        d.group_id.clone(),
+        d.artifact_id.clone(),
+        d.dep_type
+            .as_deref()
+            .unwrap_or("jar")
+            .to_string(),
+    )
+}
+
 /// Inject version/scope/exclusions from `dependencyManagement` into dependencies.
 pub fn inject_dependency_management(pom: &mut Pom) {
-    let managed: HashMap<(String, String), PomDependency> = match &pom.dependency_management {
-        Some(dm) => dm
-            .dependencies
-            .dependency
-            .iter()
-            .map(|d| ((d.group_id.clone(), d.artifact_id.clone()), d.clone()))
-            .collect(),
-        None => return,
-    };
+    let managed: HashMap<(String, String, String), PomDependency> =
+        match &pom.dependency_management {
+            Some(dm) => dm
+                .dependencies
+                .dependency
+                .iter()
+                .map(|d| (dm_key(d), d.clone()))
+                .collect(),
+            None => return,
+        };
 
     for dep in &mut pom.dependencies.dependency {
-        let key = (dep.group_id.clone(), dep.artifact_id.clone());
+        let key = dm_key(dep);
         if let Some(managed_dep) = managed.get(&key) {
             if dep.version.is_none() {
                 dep.version = managed_dep.version.clone();
@@ -1327,5 +1370,220 @@ mod tests {
         interpolate_pom(&mut pom);
         let dep = &pom.dependencies.dependency[0];
         assert_eq!(dep.version, Some("3.1.0".into()));
+    }
+
+    // ---- Tests for audit fixes ----
+
+    #[test]
+    fn interpolate_exclusion_properties() {
+        let xml = r#"
+        <project>
+            <groupId>org.example</groupId>
+            <artifactId>app</artifactId>
+            <version>1.0</version>
+            <properties>
+                <exclude.group>com.unwanted</exclude.group>
+                <exclude.artifact>bad-lib</exclude.artifact>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.lib</groupId>
+                    <artifactId>core</artifactId>
+                    <version>1.0</version>
+                    <exclusions>
+                        <exclusion>
+                            <groupId>${exclude.group}</groupId>
+                            <artifactId>${exclude.artifact}</artifactId>
+                        </exclusion>
+                    </exclusions>
+                </dependency>
+            </dependencies>
+        </project>"#;
+        let mut pom = parse_pom(xml).unwrap();
+        interpolate_pom(&mut pom);
+        let exc = &pom.dependencies.dependency[0].exclusions.exclusion[0];
+        assert_eq!(exc.group_id, "com.unwanted");
+        assert_eq!(exc.artifact_id, "bad-lib");
+    }
+
+    #[test]
+    fn interpolate_repository_url() {
+        let xml = r#"
+        <project>
+            <groupId>org.example</groupId>
+            <artifactId>app</artifactId>
+            <version>1.0</version>
+            <properties>
+                <repo.base>https://nexus.example.com</repo.base>
+            </properties>
+            <repositories>
+                <repository>
+                    <id>corp</id>
+                    <url>${repo.base}/releases</url>
+                </repository>
+            </repositories>
+        </project>"#;
+        let mut pom = parse_pom(xml).unwrap();
+        interpolate_pom(&mut pom);
+        assert_eq!(
+            pom.repositories.repository[0].url,
+            "https://nexus.example.com/releases"
+        );
+    }
+
+    #[test]
+    fn merge_parent_inherits_dependencies() {
+        let mut child = Pom {
+            model_version: None,
+            group_id: Some("org.example".into()),
+            artifact_id: Some("child".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Dependencies {
+                dependency: vec![PomDependency {
+                    group_id: "org.child".into(),
+                    artifact_id: "own-lib".into(),
+                    version: Some("2.0".into()),
+                    ..Default::default()
+                }],
+            },
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        let parent = Pom {
+            model_version: None,
+            group_id: Some("org.example".into()),
+            artifact_id: Some("parent".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: None,
+            dependencies: Dependencies {
+                dependency: vec![
+                    PomDependency {
+                        group_id: "org.parent".into(),
+                        artifact_id: "parent-lib".into(),
+                        version: Some("1.0".into()),
+                        ..Default::default()
+                    },
+                    // Same GA as child — child's version should win
+                    PomDependency {
+                        group_id: "org.child".into(),
+                        artifact_id: "own-lib".into(),
+                        version: Some("0.9".into()),
+                        ..Default::default()
+                    },
+                ],
+            },
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        merge_parent(&mut child, &parent);
+
+        // Child should now have 2 deps (own-lib kept child's, parent-lib inherited)
+        assert_eq!(child.dependencies.dependency.len(), 2);
+        let own = child.dependencies.dependency.iter()
+            .find(|d| d.artifact_id == "own-lib").unwrap();
+        assert_eq!(own.version, Some("2.0".into())); // child wins
+        let inherited = child.dependencies.dependency.iter()
+            .find(|d| d.artifact_id == "parent-lib").unwrap();
+        assert_eq!(inherited.version, Some("1.0".into())); // inherited from parent
+    }
+
+    #[test]
+    fn dm_key_includes_type() {
+        let dep_jar = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            dep_type: None, // defaults to "jar"
+            ..Default::default()
+        };
+        let dep_war = PomDependency {
+            group_id: "org.example".into(),
+            artifact_id: "lib".into(),
+            dep_type: Some("war".into()),
+            ..Default::default()
+        };
+        let key_jar = dm_key(&dep_jar);
+        let key_war = dm_key(&dep_war);
+        assert_ne!(key_jar, key_war);
+        assert_eq!(key_jar.2, "jar");
+        assert_eq!(key_war.2, "war");
+    }
+
+    #[test]
+    fn inject_dm_with_type_distinction() {
+        let mut pom = Pom {
+            model_version: None,
+            group_id: Some("org.example".into()),
+            artifact_id: Some("app".into()),
+            version: Some("1.0".into()),
+            packaging: None,
+            name: None,
+            description: None,
+            url: None,
+            parent: None,
+            properties: Default::default(),
+            dependency_management: Some(DependencyManagement {
+                dependencies: Dependencies {
+                    dependency: vec![
+                        PomDependency {
+                            group_id: "org.lib".into(),
+                            artifact_id: "core".into(),
+                            version: Some("1.0".into()),
+                            dep_type: None, // jar
+                            ..Default::default()
+                        },
+                        PomDependency {
+                            group_id: "org.lib".into(),
+                            artifact_id: "core".into(),
+                            version: Some("2.0".into()),
+                            dep_type: Some("test-jar".into()),
+                            ..Default::default()
+                        },
+                    ],
+                },
+            }),
+            dependencies: Dependencies {
+                dependency: vec![
+                    PomDependency {
+                        group_id: "org.lib".into(),
+                        artifact_id: "core".into(),
+                        dep_type: None,
+                        ..Default::default()
+                    },
+                    PomDependency {
+                        group_id: "org.lib".into(),
+                        artifact_id: "core".into(),
+                        dep_type: Some("test-jar".into()),
+                        ..Default::default()
+                    },
+                ],
+            },
+            repositories: Default::default(),
+            distribution_management: None,
+        };
+
+        inject_dependency_management(&mut pom);
+
+        let jar_dep = pom.dependencies.dependency.iter()
+            .find(|d| d.dep_type.is_none()).unwrap();
+        assert_eq!(jar_dep.version, Some("1.0".into()));
+
+        let test_jar_dep = pom.dependencies.dependency.iter()
+            .find(|d| d.dep_type.as_deref() == Some("test-jar")).unwrap();
+        assert_eq!(test_jar_dep.version, Some("2.0".into()));
     }
 }
