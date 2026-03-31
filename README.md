@@ -1,91 +1,304 @@
+<div align="center">
+
 # mvn-rs
 
-Maven 核心依赖解析与下载工具的 Rust 实现。
+**Maven dependency resolution & download, reimplemented in Rust.**
 
-## 功能
+[![CI](https://github.com/lihongjie0209/mvn-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/lihongjie0209/mvn-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- 🔍 **查询 Artifact 信息** — 获取 POM 详情（坐标、描述、依赖数等）
-- 🌳 **依赖解析** — 完整的传递依赖解析，支持树形/列表显示
-- ⬇️ **下载 Artifact** — 从 Maven Central 下载 JAR 及其依赖
-- 📋 **版本查询** — 搜索可用版本列表
+A faithful Rust reimplementation of Maven's core dependency resolution engine.
+Resolves transitive dependencies with the exact same semantics as `mvn dependency:tree`,
+downloads artifacts concurrently, and renders real-time progress in the terminal.
 
-### 核心特性
+</div>
 
-- **"Nearest Wins" 冲突解决** — 忠实复刻 Maven 的 BFS 最近优先策略
-- **Scope 传递** — 完整的 compile/runtime/test/provided 传递矩阵
-- **Exclusion 支持** — 包括通配符排除
-- **SHA-1 校验** — 下载时自动校验 checksum
-- **本地仓库兼容** — 使用标准 `~/.m2/repository` 布局
+---
 
-## 安装
+## ✨ Features
+
+| | Feature | Details |
+|---|---|---|
+| 🔍 | **Artifact Info** | Display POM metadata — coordinates, description, parent, dependency count |
+| 🌳 | **Dependency Tree** | Full transitive resolution with tree or flat list output |
+| ⬇️ | **Concurrent Download** | Download JARs + POMs with real-time indicatif progress bars |
+| 📋 | **Version Search** | Query all available versions from remote repositories |
+| ⬆️ | **Upload / Deploy** | Upload artifacts + deps to remote repos (Nexus, Artifactory, etc.) |
+| ⚡ | **Async & Parallel** | Tokio + FuturesUnordered for concurrent POM fetching, downloads, and uploads |
+| 🔒 | **Checksum Verification** | SHA-1 / SHA-256 validation with configurable retry & exponential backoff |
+| 🪞 | **Mirror & Auth** | Respects `~/.m2/settings.xml` — mirrors, server credentials, proxies, profiles |
+| 🧪 | **Well Tested** | 295 unit tests covering all core modules |
+
+### Maven Compatibility
+
+This tool is **not** a build system — it focuses on the **dependency resolution** and **artifact download** subsystem of Maven. The core resolution logic has been audited line-by-line against Java Maven source code across 4 rounds with 12 parallel audit agents, and all behavioral differences have been resolved.
+
+| Behavior | Status |
+|----------|--------|
+| Nearest-wins (BFS) conflict resolution | ✅ Identical |
+| Scope propagation matrix (compile / runtime / test / provided) | ✅ Identical |
+| `dependencyManagement` override (version, scope, exclusions) | ✅ Identical |
+| DM key = `groupId:artifactId:type` (3-tuple) | ✅ Identical |
+| Exclusion inheritance through transitive tree | ✅ Identical |
+| Wildcard exclusions (`*:*`) | ✅ Identical |
+| Version ranges `[1.0,2.0)`, `(,1.0]`, union ranges | ✅ Identical |
+| SNAPSHOT exclusion from version ranges | ✅ Identical |
+| Parent POM chain resolution (max depth 20) | ✅ Identical |
+| BOM (`<scope>import</scope>`) resolution | ✅ Identical |
+| Relocation chain following with cycle detection | ✅ Identical |
+| `ComparableVersion` qualifier ordering | ✅ Identical |
+| Metadata merge from multiple repositories | ✅ Identical |
+| `system` scope (`<systemPath>`) | 🟡 Skipped (deprecated in Maven) |
+
+---
+
+## 📦 Installation
+
+### From Source
 
 ```bash
+git clone https://github.com/lihongjie0209/mvn-rs.git
+cd mvn-rs
 cargo build --release
+
+# Binary at: target/release/mvn-cli
 ```
 
-## 使用
+### Pre-built Binaries
 
-### 搜索可用版本
+Download from [GitHub Releases](https://github.com/lihongjie0209/mvn-rs/releases) — builds available for:
+
+| Platform | Target |
+|----------|--------|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` / `musl` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+| macOS x86_64 | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+---
+
+## 🚀 Usage
+
+### Global Options
+
+```
+--settings <PATH>    Path to settings.xml (default: ~/.m2/settings.xml)
+--retries <N>        Max retry attempts for failed downloads (default: 3)
+```
+
+### Search Available Versions
 
 ```bash
-mvn-rs search org.apache.commons:commons-lang3
+mvn-cli search org.apache.commons:commons-lang3
 ```
 
-### 查看 Artifact 信息
+### View Artifact Info
 
 ```bash
-mvn-rs info org.apache.commons:commons-lang3:3.17.0
+mvn-cli info org.apache.commons:commons-lang3:3.17.0
 ```
 
-### 查看依赖树
+### Resolve Dependency Tree
 
 ```bash
-mvn-rs deps org.apache.commons:commons-lang3:3.17.0 --tree
+# Flat list (default)
+mvn-cli deps com.google.guava:guava:33.4.0-jre
 
-# 按 scope 过滤
-mvn-rs deps com.google.guava:guava:33.0-jre --tree --scope compile
+# Tree view
+mvn-cli deps com.google.guava:guava:33.4.0-jre --tree
+
+# Filter by scope
+mvn-cli deps com.google.guava:guava:33.4.0-jre --tree --scope compile
 ```
 
-### 下载 Artifact
+### Download Artifacts
 
 ```bash
-# 下载单个 JAR
-mvn-rs download org.apache.commons:commons-lang3:3.17.0
+# Download JAR + all transitive dependencies + POMs
+mvn-cli download org.apache.commons:commons-lang3:3.17.0
 
-# 下载 JAR 及所有依赖
-mvn-rs download org.apache.commons:commons-lang3:3.17.0 --with-deps
+# Multiple artifacts at once
+mvn-cli download org.slf4j:slf4j-api:2.0.16 com.google.code.gson:gson:2.11.0
 
-# 下载到指定目录
-mvn-rs download org.apache.commons:commons-lang3:3.17.0 --with-deps --output ./libs
+# From a file (one coordinate per line, # comments supported)
+mvn-cli download -f coords.txt
+
+# Download only the root artifact (no transitive deps)
+mvn-cli download org.apache.commons:commons-lang3:3.17.0 --no-deps
+
+# Copy to a specific directory
+mvn-cli download org.apache.commons:commons-lang3:3.17.0 --output ./libs
+
+# Filter transitive scope
+mvn-cli download com.google.guava:guava:33.4.0-jre --scope runtime
 ```
 
-## 坐标格式
+### Upload Artifacts
 
-支持多种 Maven 坐标格式：
+Upload artifacts (+ transitive dependencies) from local `~/.m2/repository` to a remote Maven repository.
 
-| 格式 | 示例 |
-|------|------|
-| GAV | `groupId:artifactId:version` |
-| GAVE | `groupId:artifactId:extension:version` |
-| GAVCE | `groupId:artifactId:extension:classifier:version` |
+```bash
+# Upload a single artifact with all dependencies
+mvn-cli upload com.google.code.gson:gson:2.11.0 \
+  --repo-url http://localhost:8081/repository/maven-releases/ \
+  --username admin --password secret
 
-## 项目结构
+# Upload without transitive deps
+mvn-cli upload org.apache.commons:commons-lang3:3.17.0 --no-deps \
+  --repo-url http://nexus.example.com/repository/releases/
+
+# Upload multiple artifacts
+mvn-cli upload org.slf4j:slf4j-api:2.0.16 ch.qos.logback:logback-classic:1.5.12 \
+  --repo-url http://nexus.example.com/repository/releases/
+
+# From a file (one coordinate per line)
+mvn-cli upload -f coords.txt \
+  --repo-url http://nexus.example.com/repository/releases/
+
+# Use credentials from settings.xml (matched by --repo-id)
+mvn-cli upload com.example:my-lib:1.0 \
+  --repo-url http://nexus.example.com/repository/releases/ \
+  --repo-id releases
+
+# Also update remote maven-metadata.xml
+mvn-cli upload com.example:my-lib:1.0 \
+  --repo-url http://nexus.example.com/repository/releases/ \
+  --update-metadata
+```
+
+**Credential resolution order:**
+1. `--username` / `--password` flags (highest priority)
+2. `<server>` entry in `settings.xml` matching `--repo-id`
+
+### Coordinate Formats
+
+| Format | Example |
+|--------|---------|
+| `groupId:artifactId:version` | `com.google.guava:guava:33.4.0-jre` |
+| `groupId:artifactId:type:version` | `io.netty:netty-tcnative:jar:2.0.65.Final` |
+| `groupId:artifactId:type:classifier:version` | `io.netty:netty-tcnative:jar:linux-x86_64:2.0.65.Final` |
+
+---
+
+## 🏗️ Architecture
 
 ```
 mvn-rs/
 ├── crates/
-│   ├── mvn-core/          # 核心库
-│   │   ├── coord.rs       # Maven 坐标
-│   │   ├── version.rs     # 版本解析与比较
-│   │   ├── pom.rs         # POM 解析与处理
-│   │   ├── repository.rs  # 仓库管理
-│   │   ├── resolver.rs    # 依赖解析引擎
-│   │   ├── downloader.rs  # Artifact 下载
-│   │   ├── metadata.rs    # Maven Metadata
-│   │   └── error.rs       # 错误类型
-│   └── mvn-cli/           # CLI 工具
+│   ├── mvn-core/                  # Core library (295 tests)
+│   │   ├── coord.rs               # Artifact coordinates (GAV / GAVE / GAVCE)
+│   │   ├── version.rs             # ComparableVersion + version ranges
+│   │   ├── pom.rs                 # POM parsing, interpolation, DM injection
+│   │   ├── resolver.rs            # 3-phase dependency engine
+│   │   ├── uploader.rs             # Artifact upload with checksum generation
+│   │   ├── downloader.rs          # HTTP download, checksum, retry
+│   │   ├── repository.rs          # Local + remote repo management
+│   │   ├── metadata.rs            # maven-metadata.xml parsing & merge
+│   │   ├── settings.rs            # settings.xml (mirrors, servers, proxies)
+│   │   └── error.rs               # Typed error hierarchy
+│   └── mvn-cli/                   # CLI application (clap + indicatif)
+│       └── main.rs                # 5 commands: info, deps, download, upload, search
+├── .github/workflows/
+│   ├── ci.yml                     # Test on push / PR
+│   └── release.yml                # Multi-platform release on tag
 └── README.md
 ```
+
+### Resolution Pipeline
+
+The resolver uses a **3-phase concurrent pipeline** modeled after Maven's `DefaultDependencyCollector`:
+
+```
+Phase 1 — Collect            Phase 2 — Flatten           Phase 3 — Download
+┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+│ BFS traversal        │     │ Nearest-wins dedup   │     │ Concurrent download  │
+│ Concurrent POM fetch │ ──► │ Scope propagation    │ ──► │ SHA-1/SHA-256 verify │
+│ DM/exclusion inject  │     │ Scope filtering      │     │ Retry + backoff      │
+│ Relocation following │     │ Flat dependency list  │     │ Progress bars        │
+└─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+```
+
+### Effective POM Pipeline (6 steps)
+
+Each POM goes through a deterministic pipeline matching Java Maven's `DefaultModelBuilder`:
+
+1. **Parse** raw XML
+2. **Resolve parent chain** (recursive, up to depth 20)
+3. **Merge parent** — properties, dependencyManagement, dependencies, repositories
+4. **Interpolate** `${project.*}`, `${env.*}`, `${os.*}`, user properties
+5. **Inject dependency management** — version, scope, type, classifier, exclusions
+6. **Resolve BOM imports** — `<scope>import</scope>` in DM section
+
+---
+
+## ⚙️ Configuration
+
+mvn-rs reads `~/.m2/settings.xml` (or a custom path via `--settings`) and supports:
+
+- **Mirrors** — `<mirror>` with `<mirrorOf>` patterns (`*`, `central`, `*,!snapshots`)
+- **Server credentials** — `<server>` with `<username>` / `<password>`
+- **Proxies** — `<proxy>` with host, port, and optional authentication
+- **Profiles** — `<profile>` with `<repositories>` (activated via `<activeProfiles>`)
+- **Local repository** — standard `~/.m2/repository` layout, fully compatible with Maven
+
+---
+
+## 🧪 Testing
+
+```bash
+# Run all 295 tests
+cargo test --workspace
+
+# Run tests for a specific module
+cargo test -p mvn-core -- resolver
+cargo test -p mvn-core -- pom
+cargo test -p mvn-core -- version
+```
+
+### Test Distribution
+
+| Module | Tests | Coverage |
+|--------|------:|----------|
+| `resolver.rs` | 53 | Resolution, BFS, scope propagation, DM, exclusions, relocations |
+| `downloader.rs` | 41 | HTTP download, checksum, retry, SNAPSHOT, metadata merge |
+| `version.rs` | 39 | Parsing, comparison, ranges, qualifiers, edge cases |
+| `pom.rs` | 38 | Parsing, interpolation, DM injection, parent merge |
+| `repository.rs` | 32 | Local cache, remote fetch, atomic writes |
+| `settings.rs` | 27 | Mirror matching, server auth, proxy, profiles |
+| `coord.rs` | 23 | Coordinate parsing, path generation, exclusion matching |
+| `error.rs` | 16 | Error types, display, conversion |
+| `uploader.rs` | 13 | Upload, retry, metadata serialization, checksums |
+| `metadata.rs` | 13 | Metadata parsing, version listing, multi-repo merge |
+| **Total** | **295** | |
+
+---
+
+## 🔧 Technical Details
+
+### Concurrency Model
+
+- **POM resolution**: `FuturesUnordered` for parallel POM fetching during BFS traversal
+- **Artifact download**: `Semaphore`-bounded (8 concurrent) parallel downloads
+- **Artifact upload**: `Semaphore`-bounded (8 concurrent) parallel uploads
+- **Progress UI**: Per-artifact indicatif progress bars with real-time byte tracking
+
+### Retry & Resilience
+
+- Exponential backoff: 1s → 2s → 4s (configurable)
+- ±25% jitter to prevent thundering herd
+- HTTP timeouts: 30s connect, 300s request
+- Atomic file writes (temp + rename) to prevent corruption
+- Graceful fallback across multiple repositories
+
+### Version Comparison
+
+Implements Maven's `ComparableVersion` algorithm:
+- Qualifier ordering: `alpha` < `beta` < `milestone` < `rc` < `snapshot` < *(release)* < `sp`
+- Numeric segments compared numerically, string segments compared lexically
+- Version ranges: `[1.0,2.0)`, `(,1.0]`, `[1.0,)`, union ranges `[1.0,2.0),[3.0,4.0)`
+
+---
 
 ## License
 

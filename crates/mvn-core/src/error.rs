@@ -38,6 +38,9 @@ pub enum MvnError {
 
     #[error("settings parse error: {message}")]
     SettingsParseError { message: String },
+
+    #[error("upload failed for '{url}': {message}")]
+    UploadError { url: String, message: String },
 }
 
 impl From<reqwest::Error> for MvnError {

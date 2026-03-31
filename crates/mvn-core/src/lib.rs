@@ -7,3 +7,4 @@ pub mod resolver;
 pub mod downloader;
 pub mod metadata;
 pub mod settings;
+pub mod uploader;

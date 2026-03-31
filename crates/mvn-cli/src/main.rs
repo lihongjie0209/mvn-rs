@@ -13,8 +13,10 @@ use tokio::sync::Semaphore;
 
 use mvn_core::coord::{ArtifactCoord, DependencyScope};
 use mvn_core::downloader::{ArtifactDownloader, RetryConfig};
+use mvn_core::repository::RemoteRepository;
 use mvn_core::resolver::{format_tree, DependencyResolver};
 use mvn_core::settings;
+use mvn_core::uploader::ArtifactUploader;
 
 // ---------------------------------------------------------------------------
 // Global MultiProgress handle for routing tracing output through indicatif
@@ -111,8 +113,11 @@ enum Commands {
     },
     /// Download artifact and all transitive dependencies
     Download {
-        /// Artifact coordinates (groupId:artifactId:version)
-        coord: String,
+        /// Artifact coordinates (groupId:artifactId:version), can specify multiple
+        coords: Vec<String>,
+        /// File containing coordinates, one per line
+        #[arg(long, short = 'f')]
+        file: Option<String>,
         /// Skip downloading transitive dependencies (only download the artifact itself)
         #[arg(long)]
         no_deps: bool,
@@ -128,6 +133,35 @@ enum Commands {
         /// Artifact coordinates (groupId:artifactId, version optional)
         coord: String,
     },
+    /// Upload artifact and dependencies to a remote repository
+    Upload {
+        /// Artifact coordinates (groupId:artifactId:version), can specify multiple
+        coords: Vec<String>,
+        /// File containing coordinates, one per line
+        #[arg(long, short = 'f')]
+        file: Option<String>,
+        /// Target repository URL (e.g. http://localhost:8081/repository/maven-releases/)
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Repository ID — used to look up credentials in settings.xml
+        #[arg(long)]
+        repo_id: Option<String>,
+        /// Username for the target repository (overrides settings.xml)
+        #[arg(long)]
+        username: Option<String>,
+        /// Password for the target repository (overrides settings.xml)
+        #[arg(long)]
+        password: Option<String>,
+        /// Skip uploading transitive dependencies (only upload the artifact itself)
+        #[arg(long)]
+        no_deps: bool,
+        /// Scope filter for dependency uploads (compile, runtime, test, all)
+        #[arg(long, default_value = "compile")]
+        scope: String,
+        /// Also update remote maven-metadata.xml
+        #[arg(long)]
+        update_metadata: bool,
+    },
 }
 
 fn parse_coord(s: &str) -> Result<ArtifactCoord> {
@@ -141,6 +175,35 @@ fn parse_scope_filter(s: &str) -> Result<Option<DependencyScope>> {
         let scope = DependencyScope::from_str(s).map_err(|e| anyhow::anyhow!(e))?;
         Ok(Some(scope))
     }
+}
+
+/// Collect coordinates from positional args + optional `--file` (one per line).
+fn collect_coords(args: &[String], file: Option<&str>) -> Result<Vec<ArtifactCoord>> {
+    let mut coords = Vec::new();
+
+    for s in args {
+        coords.push(parse_coord(s)?);
+    }
+
+    if let Some(path) = file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read coordinate file '{path}'"))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            coords.push(
+                parse_coord(trimmed)
+                    .with_context(|| format!("invalid coordinate in file: '{trimmed}'"))?,
+            );
+        }
+    }
+
+    if coords.is_empty() {
+        anyhow::bail!("no coordinates provided — pass them as arguments or via --file");
+    }
+    Ok(coords)
 }
 
 fn spinner(msg: &str) -> ProgressBar {
@@ -303,25 +366,37 @@ async fn cmd_deps(
 
 async fn cmd_download(
     downloader: &ArtifactDownloader,
-    coord_str: &str,
+    coords: &[ArtifactCoord],
     no_deps: bool,
     output: Option<&str>,
     scope_str: &str,
 ) -> Result<()> {
-    let coord = parse_coord(coord_str).context("invalid coordinates")?;
-
     // Simple single-artifact download (--no-deps)
     if no_deps {
-        let pb = spinner(&format!("⬇️  Downloading {coord}..."));
-        let path = downloader
-            .download_artifact(&coord)
-            .await
-            .context("failed to download artifact")?;
-        pb.finish_and_clear();
+        let mp = GLOBAL_MP.get().cloned().unwrap_or_else(MultiProgress::new);
+        let main_bar = mp.add(ProgressBar::new(coords.len() as u64));
+        main_bar.set_style(
+            ProgressStyle::with_template("  {bar:40.green/dark_gray} {pos}/{len}  {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("━━─"),
+        );
+        let mut paths = Vec::new();
+        for coord in coords {
+            main_bar.set_message(coord.to_string());
+            let path = downloader
+                .download_artifact(coord)
+                .await
+                .with_context(|| format!("failed to download {coord}"))?;
+            paths.push(path);
+            main_bar.inc(1);
+        }
+        main_bar.finish_and_clear();
         println!("{}", "✅ Download complete".green().bold());
-        maybe_copy_files(&[path.clone()], output)?;
+        maybe_copy_files(&paths, output)?;
         if output.is_none() {
-            println!("  {}", path.display());
+            for p in &paths {
+                println!("  {}", p.display());
+            }
         }
         println!();
         return Ok(());
@@ -331,26 +406,40 @@ async fn cmd_download(
 
     let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
 
-    // Phase 1: Resolve dependencies
+    // Phase 1: Resolve dependencies for ALL requested coordinates
     let pb = spinner("Resolving dependencies...");
-    let result = resolve_deps(downloader, &coord, scope_filter).await?;
-    pb.finish_and_clear();
-
-    // Collect downloadable artifacts (JARs etc.) and pom-only deps separately
-    let mut download_coords: Vec<ArtifactCoord> = Vec::new();
+    let mut all_download_coords: Vec<ArtifactCoord> = Vec::new();
     let mut pom_only_coords: Vec<ArtifactCoord> = Vec::new();
-    for d in &result.dependencies {
-        if d.coord.extension == "pom" {
-            pom_only_coords.push(d.coord.clone());
-        } else {
-            download_coords.push(d.coord.clone());
+    let mut root_coords: Vec<ArtifactCoord> = Vec::new();
+
+    for coord in coords {
+        let result = resolve_deps(downloader, coord, scope_filter).await?;
+        root_coords.push(coord.clone());
+        for d in &result.dependencies {
+            if d.coord.extension == "pom" {
+                if !pom_only_coords.iter().any(|c| c == &d.coord) {
+                    pom_only_coords.push(d.coord.clone());
+                }
+            } else if !all_download_coords.iter().any(|c| c == &d.coord) {
+                all_download_coords.push(d.coord.clone());
+            }
         }
     }
+    pb.finish_and_clear();
 
-    // Include root artifact
-    let mut all_coords = vec![coord.clone()];
-    all_coords.extend(download_coords);
-    let total = all_coords.len();
+    // Include root artifacts + deduplicated deps
+    let mut combined: Vec<ArtifactCoord> = Vec::new();
+    for rc in &root_coords {
+        if !combined.iter().any(|c| c == rc) {
+            combined.push(rc.clone());
+        }
+    }
+    for dc in &all_download_coords {
+        if !combined.iter().any(|c| c == dc) {
+            combined.push(dc.clone());
+        }
+    }
+    let total = combined.len();
 
     // Phase 2: Build progress display
     //
@@ -366,12 +455,22 @@ async fn cmd_download(
     header.set_style(
         ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
-    header.set_message(format!(
-        "\n  {} {} {}",
-        "📦".to_string(),
-        coord.to_string().bold(),
-        format!("(+{} dependencies)", total - 1).dimmed(),
-    ));
+    let header_msg = if root_coords.len() == 1 {
+        format!(
+            "\n  {} {} {}",
+            "📦".to_string(),
+            root_coords[0].to_string().bold(),
+            format!("(+{} dependencies)", total - 1).dimmed(),
+        )
+    } else {
+        format!(
+            "\n  {} {} artifacts {}",
+            "📦".to_string(),
+            root_coords.len().to_string().bold(),
+            format!("({} total to download)", total).dimmed(),
+        )
+    };
+    header.set_message(header_msg);
     header.finish();
 
     // Main progress bar
@@ -453,7 +552,7 @@ async fn cmd_download(
     let semaphore = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
     let mut futures = FuturesUnordered::new();
 
-    for dl_coord in all_coords {
+    for dl_coord in combined {
         let sem = semaphore.clone();
         let reused = reused.clone();
         let downloaded = downloaded.clone();
@@ -666,6 +765,279 @@ fn build_downloader(cli: &Cli) -> anyhow::Result<ArtifactDownloader> {
     Ok(ArtifactDownloader::from_settings_with_retry(&settings, retry_config))
 }
 
+/// Build a target `RemoteRepository` for upload from CLI flags + settings.
+fn build_upload_target(
+    cli: &Cli,
+    repo_url: Option<&str>,
+    repo_id: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<RemoteRepository> {
+    let settings_path = cli.settings.as_ref().map(|s| Path::new(s.as_str()));
+    let settings = settings::load_settings(settings_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let url = repo_url
+        .ok_or_else(|| anyhow::anyhow!("--repo-url is required for upload"))?;
+
+    let id = repo_id.unwrap_or("upload-target");
+
+    // CLI credentials override settings.xml
+    let (user, pass) = match (username, password) {
+        (Some(u), Some(p)) => (Some(u.to_string()), Some(p.to_string())),
+        _ => {
+            // Look up in settings.xml by repo ID
+            if let Some(server) = settings.find_server(id) {
+                (server.username.clone(), server.password.clone())
+            } else {
+                (None, None)
+            }
+        }
+    };
+
+    let mut repo = RemoteRepository::new(id, url);
+    repo.username = user;
+    repo.password = pass;
+    Ok(repo)
+}
+
+// ---------------------------------------------------------------------------
+// upload
+// ---------------------------------------------------------------------------
+
+async fn cmd_upload(
+    downloader: &ArtifactDownloader,
+    cli: &Cli,
+    coords: &[ArtifactCoord],
+    repo_url: Option<&str>,
+    repo_id: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+    no_deps: bool,
+    scope_str: &str,
+    update_metadata: bool,
+) -> Result<()> {
+    let target = build_upload_target(cli, repo_url, repo_id, username, password)?;
+
+    let settings_path = cli.settings.as_ref().map(|s| Path::new(s.as_str()));
+    let settings = settings::load_settings(settings_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let uploader = Arc::new(ArtifactUploader::from_settings(&settings));
+
+    // Phase 1: Ensure artifacts are in local repo (download if needed)
+    let mut upload_coords: Vec<ArtifactCoord> = Vec::new();
+
+    if no_deps {
+        // Just the root artifacts
+        for coord in coords {
+            if !uploader.local_repo().has_artifact(coord) {
+                let pb = spinner(&format!("Downloading {} to local repo...", coord));
+                downloader.download_artifact(coord).await
+                    .with_context(|| format!("failed to download {coord}"))?;
+                pb.finish_and_clear();
+            }
+            if !upload_coords.iter().any(|c| c == coord) {
+                upload_coords.push(coord.clone());
+            }
+        }
+    } else {
+        // Resolve + download dependencies first
+        let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
+
+        let pb = spinner("Resolving dependencies...");
+        for coord in coords {
+            let result = resolve_deps(downloader, coord, scope_filter).await?;
+            if !upload_coords.iter().any(|c| c == coord) {
+                upload_coords.push(coord.clone());
+            }
+            for d in &result.dependencies {
+                if d.coord.extension != "pom" && !upload_coords.iter().any(|c| c == &d.coord) {
+                    upload_coords.push(d.coord.clone());
+                }
+            }
+        }
+        pb.finish_and_clear();
+
+        // Ensure all are in local repo
+        let missing: Vec<_> = upload_coords
+            .iter()
+            .filter(|c| !uploader.local_repo().artifact_path(c).exists())
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let pb = spinner(&format!("Downloading {} missing artifacts...", missing.len()));
+            for coord in &missing {
+                let _ = downloader.download_artifact(coord).await;
+            }
+            pb.finish_and_clear();
+        }
+    }
+
+    let total = upload_coords.len();
+
+    // Phase 2: Upload with progress
+    let mp = GLOBAL_MP.get().cloned().unwrap_or_else(MultiProgress::new);
+
+    let header = mp.add(ProgressBar::new(0));
+    header.set_style(
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    header.set_message(format!(
+        "\n  {} Uploading {} artifact(s) to {}",
+        "⬆️ ".to_string(),
+        total.to_string().bold(),
+        target.url.bold(),
+    ));
+    header.finish();
+
+    let main_bar = mp.add(ProgressBar::new(total as u64));
+    main_bar.set_style(
+        ProgressStyle::with_template("  {bar:40.cyan/dark_gray} {pos}/{len}  {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("━━─"),
+    );
+
+    let stats_bar = mp.add(ProgressBar::new(0));
+    stats_bar.set_style(
+        ProgressStyle::with_template("  {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    stats_bar.set_message("waiting...");
+
+    let spacer = mp.add(ProgressBar::new(0));
+    spacer.set_style(
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spacer.set_message("");
+    spacer.finish();
+
+    let uploaded_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let skipped_count = Arc::new(AtomicUsize::new(0));
+
+    let update_stats = {
+        let stats_bar = stats_bar.clone();
+        let uploaded_count = uploaded_count.clone();
+        let failed_count = failed_count.clone();
+        let skipped_count = skipped_count.clone();
+        move || {
+            let u = uploaded_count.load(Ordering::Relaxed);
+            let f = failed_count.load(Ordering::Relaxed);
+            let s = skipped_count.load(Ordering::Relaxed);
+            let done = u + f + s;
+
+            let mut parts = Vec::new();
+            if u > 0 {
+                parts.push(format!("uploaded {}", u.to_string().green()));
+            }
+            if s > 0 {
+                parts.push(format!("skipped {}", s.to_string().blue()));
+            }
+            if f > 0 {
+                parts.push(format!("failed {}", f.to_string().red()));
+            }
+            if done == total {
+                parts.push("done".green().bold().to_string());
+            }
+            if parts.is_empty() {
+                stats_bar.set_message("uploading...");
+            } else {
+                stats_bar.set_message(parts.join(", "));
+            }
+        }
+    };
+    update_stats();
+
+    let semaphore = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
+    let mut futures = FuturesUnordered::new();
+
+    for coord in upload_coords.clone() {
+        let sem = semaphore.clone();
+        let uploaded_count = uploaded_count.clone();
+        let failed_count = failed_count.clone();
+        let main_bar = main_bar.clone();
+        let mp = mp.clone();
+        let update_stats = update_stats.clone();
+        let spacer = spacer.clone();
+        let target = target.clone();
+        let uploader = uploader.clone();
+
+        futures.push(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+
+            let spin = mp.insert_before(&spacer, ProgressBar::new_spinner());
+            spin.set_style(
+                ProgressStyle::with_template("    {spinner:.cyan} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            spin.set_message(format!("↑ {}", coord));
+            spin.enable_steady_tick(std::time::Duration::from_millis(80));
+
+            let result = uploader.upload_artifact(&coord, &target).await;
+
+            spin.finish_and_clear();
+            mp.remove(&spin);
+
+            match &result {
+                Ok(_) => { uploaded_count.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => { failed_count.fetch_add(1, Ordering::Relaxed); }
+            }
+
+            main_bar.inc(1);
+            update_stats();
+
+            (coord, result)
+        });
+    }
+
+    let mut upload_results = Vec::new();
+    while let Some((coord, result)) = futures.next().await {
+        match &result {
+            Ok(ur) => {
+                tracing::debug!("uploaded {} ({} files)", coord, ur.uploaded_files.len());
+            }
+            Err(e) => {
+                eprintln!("  ⚠ failed to upload {}: {}", coord, e);
+            }
+        }
+        upload_results.push((coord, result));
+    }
+
+    main_bar.finish();
+    stats_bar.finish();
+    spacer.finish_and_clear();
+
+    // Phase 3: Update remote metadata if requested
+    if update_metadata {
+        let pb = spinner("Updating remote metadata...");
+        for coord in &upload_coords {
+            if let Err(e) = uploader.update_remote_metadata(coord, &target).await {
+                tracing::warn!("failed to update metadata for {}: {}", coord, e);
+            }
+        }
+        pb.finish_and_clear();
+    }
+
+    // Summary
+    let u = uploaded_count.load(Ordering::Relaxed);
+    let f = failed_count.load(Ordering::Relaxed);
+    println!();
+    if f == 0 {
+        println!(
+            "{}",
+            format!("  ✅ {u} artifact(s) uploaded to {}", target.url)
+                .green()
+                .bold()
+        );
+    } else {
+        println!(
+            "{}",
+            format!("  ⚠️  {u} uploaded, {f} failed").yellow().bold()
+        );
+    }
+    println!();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -696,16 +1068,56 @@ async fn main() {
         }
     };
 
-    let result = match cli.command {
-        Commands::Info { coord } => cmd_info(&downloader, &coord).await,
-        Commands::Deps { coord, tree, scope } => cmd_deps(&downloader, &coord, tree, &scope).await,
+    let result = match &cli.command {
+        Commands::Info { coord } => cmd_info(&downloader, coord).await,
+        Commands::Deps { coord, tree, scope } => cmd_deps(&downloader, coord, *tree, scope).await,
         Commands::Download {
-            coord,
+            coords,
+            file,
             no_deps,
             output,
             scope,
-        } => cmd_download(&downloader, &coord, no_deps, output.as_deref(), &scope).await,
-        Commands::Search { coord } => cmd_search(&downloader, &coord).await,
+        } => {
+            let parsed = collect_coords(coords, file.as_deref());
+            match parsed {
+                Ok(coord_list) => {
+                    cmd_download(&downloader, &coord_list, *no_deps, output.as_deref(), scope).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Search { coord } => cmd_search(&downloader, coord).await,
+        Commands::Upload {
+            coords,
+            file,
+            repo_url,
+            repo_id,
+            username,
+            password,
+            no_deps,
+            scope,
+            update_metadata,
+        } => {
+            let parsed = collect_coords(coords, file.as_deref());
+            match parsed {
+                Ok(coord_list) => {
+                    cmd_upload(
+                        &downloader,
+                        &cli,
+                        &coord_list,
+                        repo_url.as_deref(),
+                        repo_id.as_deref(),
+                        username.as_deref(),
+                        password.as_deref(),
+                        *no_deps,
+                        scope,
+                        *update_metadata,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+        }
     };
 
     if let Err(e) = result {
