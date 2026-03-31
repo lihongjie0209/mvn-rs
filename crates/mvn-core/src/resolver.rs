@@ -343,6 +343,15 @@ impl<'a> DependencyResolver<'a> {
                 if matches!(scope, DependencyScope::Import | DependencyScope::System) {
                     continue;
                 }
+                // Test and Provided scoped deps are NOT transitive in Maven.
+                // Only the root POM (depth 0) should include them; transitive
+                // POMs must skip them to avoid fetching non-existent test
+                // artifacts and to match real Maven behaviour.
+                if depth > 0
+                    && matches!(scope, DependencyScope::Test | DependencyScope::Provided)
+                {
+                    continue;
+                }
                 if dep.optional.as_deref() == Some("true") {
                     continue;
                 }
