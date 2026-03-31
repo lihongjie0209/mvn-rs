@@ -336,13 +336,16 @@ async fn cmd_download(
     let result = resolve_deps(downloader, &coord, scope_filter).await?;
     pb.finish_and_clear();
 
-    // Collect downloadable artifacts (skip pom-packaging)
-    let download_coords: Vec<ArtifactCoord> = result
-        .dependencies
-        .iter()
-        .filter(|d| d.coord.extension != "pom")
-        .map(|d| d.coord.clone())
-        .collect();
+    // Collect downloadable artifacts (JARs etc.) and pom-only deps separately
+    let mut download_coords: Vec<ArtifactCoord> = Vec::new();
+    let mut pom_only_coords: Vec<ArtifactCoord> = Vec::new();
+    for d in &result.dependencies {
+        if d.coord.extension == "pom" {
+            pom_only_coords.push(d.coord.clone());
+        } else {
+            download_coords.push(d.coord.clone());
+        }
+    }
 
     // Include root artifact
     let mut all_coords = vec![coord.clone()];
@@ -520,7 +523,14 @@ async fn cmd_download(
 
     while let Some((dl_coord, result)) = futures.next().await {
         match result {
-            Ok(path) => downloaded_paths.push(path),
+            Ok(path) => {
+                downloaded_paths.push(path);
+                // Also include the POM file alongside the artifact
+                let pom_path = downloader.repo_system().local.pom_path(&dl_coord);
+                if pom_path.exists() {
+                    downloaded_paths.push(pom_path);
+                }
+            }
             Err(e) => {
                 tracing::warn!("failed to download {}: {}", dl_coord, e);
             }
@@ -531,6 +541,14 @@ async fn cmd_download(
     main_bar.finish();
     stats_bar.finish();
     spacer.finish_and_clear();
+
+    // Include POM files for pom-only dependencies (already in local repo from resolution)
+    for pc in &pom_only_coords {
+        let pom_path = downloader.repo_system().local.pom_path(pc);
+        if pom_path.exists() {
+            downloaded_paths.push(pom_path);
+        }
+    }
 
     println!();
 
