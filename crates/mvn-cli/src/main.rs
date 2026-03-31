@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -8,63 +8,20 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table};
 use futures::stream::{FuturesUnordered, StreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Semaphore;
 
 use mvn_core::coord::{ArtifactCoord, DependencyScope};
 use mvn_core::downloader::{ArtifactDownloader, RetryConfig};
-use mvn_core::resolver::{format_tree, DependencyNode, DependencyResolver};
+use mvn_core::resolver::{format_tree, DependencyResolver};
 use mvn_core::settings;
 
 // ---------------------------------------------------------------------------
-// Shared tree helpers
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 /// Maximum concurrent artifact downloads.
 const MAX_DOWNLOAD_CONCURRENCY: usize = 8;
-
-/// A flattened tree line with prefix, coordinate, and scope for display.
-struct TreeLine {
-    prefix: String,
-    coord: ArtifactCoord,
-    scope: DependencyScope,
-}
-
-/// Walk the dependency tree depth-first, collecting display lines with
-/// proper tree prefixes (├──, └──, │, etc.).
-fn collect_tree_lines(nodes: &[DependencyNode], prefix: &str, lines: &mut Vec<TreeLine>) {
-    let len = nodes.len();
-    for (i, node) in nodes.iter().enumerate() {
-        let is_last = i + 1 == len;
-        let connector = if is_last { "└── " } else { "├── " };
-        let child_prefix = format!(
-            "{}{}",
-            prefix,
-            if is_last { "    " } else { "│   " }
-        );
-
-        lines.push(TreeLine {
-            prefix: format!("{prefix}{connector}"),
-            coord: node.coord.clone(),
-            scope: node.scope,
-        });
-
-        collect_tree_lines(&node.children, &child_prefix, lines);
-    }
-}
-
-/// Format a byte count as a human-readable string.
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
 
 /// Resolve dependencies (shared between `deps` and `download` commands).
 async fn resolve_deps(
@@ -326,7 +283,7 @@ async fn cmd_download(
         return Ok(());
     }
 
-    // ----- Full dependency download with live tree display -----
+    // ----- Full dependency download with real-time progress -----
 
     let scope_filter = parse_scope_filter(scope_str).context("invalid scope")?;
 
@@ -348,148 +305,189 @@ async fn cmd_download(
     all_coords.extend(download_coords);
     let total = all_coords.len();
 
-    // Phase 2: Build the live tree display
+    // Phase 2: Build progress display
+    //
+    //  📦 com.google.guava:guava:33.4.0-jre (+7 dependencies)
+    //  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7/7
+    //  resolved 7, reused 5, downloaded 2 (1.2 MB), added 7, done
+    //
     let mp = MultiProgress::new();
 
-    // Header line
-    let header_style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
+    // Header (static)
     let header = mp.add(ProgressBar::new(0));
-    header.set_style(header_style.clone());
+    header.set_style(
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
     header.set_message(format!(
-        "\n{}  {}",
+        "\n  {} {} {}",
         "📦".to_string(),
-        format!("{coord}  ({} dependencies)", result.dependencies.len()).bold().to_string(),
+        coord.to_string().bold(),
+        format!("(+{} dependencies)", total - 1).dimmed(),
     ));
     header.finish();
 
-    // Collect tree lines and create bars
-    let mut lines = Vec::new();
-    collect_tree_lines(&result.tree, "", &mut lines);
+    // Main progress bar
+    let main_bar = mp.add(ProgressBar::new(total as u64));
+    main_bar.set_style(
+        ProgressStyle::with_template(
+            "  {bar:40.green/dark_gray} {pos}/{len}  {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("━━─"),
+    );
+    main_bar.set_message("");
 
-    let line_style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
+    // Stats line (updated in real-time)
+    let stats_bar = mp.add(ProgressBar::new(0));
+    stats_bar.set_style(
+        ProgressStyle::with_template("  {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    stats_bar.set_message("waiting...");
 
-    // Map: coord_string → (ProgressBar, prefix, scope)
-    struct LiveBar {
-        pb: ProgressBar,
-        prefix: String,
-        scope: DependencyScope,
-    }
+    // Spacer between stats and active downloads
+    let spacer = mp.add(ProgressBar::new(0));
+    spacer.set_style(
+        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spacer.set_message("");
+    spacer.finish();
 
-    let mut bar_map: HashMap<String, LiveBar> = HashMap::new();
+    // Shared counters
+    let reused = Arc::new(AtomicUsize::new(0));
+    let downloaded = Arc::new(AtomicUsize::new(0));
+    let dl_failed = Arc::new(AtomicUsize::new(0));
+    let added = Arc::new(AtomicUsize::new(0));
+    let total_bytes = Arc::new(AtomicU64::new(0));
 
-    for line in &lines {
-        let pb = mp.add(ProgressBar::new(0));
-        pb.set_style(line_style.clone());
-        pb.set_message(format!(
-            "{}{} {} {}",
-            line.prefix.dimmed(),
-            line.coord,
-            colored_scope_str(&line.scope),
-            "⏳".dimmed(),
-        ));
-        pb.finish();
+    // Closure to refresh the stats line
+    let update_stats = {
+        let stats_bar = stats_bar.clone();
+        let reused = reused.clone();
+        let downloaded = downloaded.clone();
+        let dl_failed = dl_failed.clone();
+        let added = added.clone();
+        let total_bytes = total_bytes.clone();
+        move || {
+            let r = reused.load(Ordering::Relaxed);
+            let d = downloaded.load(Ordering::Relaxed);
+            let f = dl_failed.load(Ordering::Relaxed);
+            let a = added.load(Ordering::Relaxed);
+            let b = total_bytes.load(Ordering::Relaxed);
+            let done = r + d + f;
 
-        bar_map.insert(
-            line.coord.to_string(),
-            LiveBar {
-                pb,
-                prefix: line.prefix.clone(),
-                scope: line.scope,
-            },
-        );
-    }
+            let mut parts = Vec::new();
+            parts.push(format!("resolved {}", total.to_string().cyan()));
+            if r > 0 {
+                parts.push(format!("reused {}", r.to_string().blue()));
+            }
+            if d > 0 || f == 0 {
+                parts.push(format!(
+                    "downloaded {} ({})",
+                    d.to_string().green(),
+                    HumanBytes(b)
+                ));
+            }
+            if f > 0 {
+                parts.push(format!("failed {}", f.to_string().red()));
+            }
+            parts.push(format!("added {}", a.to_string().green()));
+            if done == total {
+                parts.push("done".green().bold().to_string());
+            }
 
-    // Summary / progress bar at the bottom
-    let summary_style = ProgressStyle::with_template(
-        "\n  {msg} [{bar:35.cyan/dim}] {pos}/{len} artifacts",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar());
-    let summary = mp.add(ProgressBar::new(total as u64));
-    summary.set_style(summary_style);
-    summary.set_message("⬇️  Downloading");
+            stats_bar.set_message(parts.join(", "));
+        }
+    };
 
-    // Phase 3: Download concurrently, updating bars in real-time
+    update_stats();
+
+    // Phase 3: Download concurrently with per-artifact spinners
     let semaphore = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
-    let bar_map = Arc::new(bar_map);
-
     let mut futures = FuturesUnordered::new();
 
     for dl_coord in all_coords {
         let sem = semaphore.clone();
-        let bars = bar_map.clone();
+        let reused = reused.clone();
+        let downloaded = downloaded.clone();
+        let dl_failed = dl_failed.clone();
+        let added = added.clone();
+        let total_bytes = total_bytes.clone();
+        let main_bar = main_bar.clone();
+        let mp = mp.clone();
+        let update_stats = update_stats.clone();
+        let spacer = spacer.clone();
 
         futures.push(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
-            // Update bar → downloading
-            let key = dl_coord.to_string();
-            if let Some(bar) = bars.get(&key) {
-                bar.pb.set_message(format!(
-                    "{}{} {} {}",
-                    bar.prefix.dimmed(),
-                    dl_coord.to_string().cyan(),
-                    colored_scope_str(&bar.scope),
-                    "⬇️ ",
-                ));
-            }
+            // Show active spinner for this artifact
+            let spin = mp.insert_before(&spacer, ProgressBar::new_spinner());
+            spin.set_style(
+                ProgressStyle::with_template("    {spinner:.cyan} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            let short_name = format!(
+                "{}:{}:{}",
+                dl_coord.group_id, dl_coord.artifact_id, dl_coord.version
+            );
+            spin.set_message(short_name.clone());
+            spin.enable_steady_tick(std::time::Duration::from_millis(80));
+
+            // Check local cache
+            let was_cached = downloader
+                .repo_system()
+                .local
+                .artifact_path(&dl_coord)
+                .exists();
 
             let result = downloader.download_artifact(&dl_coord).await;
 
-            // Update bar → done / failed
-            if let Some(bar) = bars.get(&key) {
-                match &result {
-                    Ok(path) => {
-                        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                        bar.pb.set_message(format!(
-                            "{}{} {} {} {}",
-                            bar.prefix.dimmed(),
-                            dl_coord.to_string().green(),
-                            colored_scope_str(&bar.scope),
-                            "✅".to_string(),
-                            format_bytes(size).dimmed(),
-                        ));
+            // Remove spinner
+            spin.finish_and_clear();
+            mp.remove(&spin);
+
+            // Update counters
+            match &result {
+                Ok(path) => {
+                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    if was_cached {
+                        reused.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        downloaded.fetch_add(1, Ordering::Relaxed);
+                        total_bytes.fetch_add(size, Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        bar.pb.set_message(format!(
-                            "{}{} {} {}",
-                            bar.prefix.dimmed(),
-                            dl_coord.to_string().red(),
-                            colored_scope_str(&bar.scope),
-                            "❌".to_string(),
-                        ));
-                    }
+                    added.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    dl_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
+
+            main_bar.inc(1);
+            update_stats();
 
             (dl_coord, result)
         });
     }
 
     let mut downloaded_paths: Vec<PathBuf> = Vec::new();
-    let mut failed = 0usize;
 
     while let Some((dl_coord, result)) = futures.next().await {
-        summary.inc(1);
         match result {
             Ok(path) => downloaded_paths.push(path),
             Err(e) => {
-                failed += 1;
                 tracing::warn!("failed to download {}: {}", dl_coord, e);
             }
         }
     }
 
-    summary.finish_with_message(if failed > 0 {
-        format!(
-            "✅ Downloaded {} artifacts ({} failed)",
-            downloaded_paths.len(),
-            failed
-        )
-    } else {
-        format!("✅ Downloaded {} artifacts", downloaded_paths.len())
-    });
+    // Finish bars
+    main_bar.finish();
+    stats_bar.finish();
+    spacer.finish_and_clear();
+
+    println!();
 
     // Phase 4: Copy to output directory if requested
     maybe_copy_files(&downloaded_paths, output)?;
