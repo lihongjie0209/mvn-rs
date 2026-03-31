@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::coord::ArtifactCoord;
 use crate::error::{MvnError, Result};
@@ -68,6 +69,15 @@ impl RemoteRepository {
         format!(
             "{}/{}/{}/maven-metadata.xml",
             self.url, group_path, artifact_id
+        )
+    }
+
+    /// URL for version-level metadata (used for SNAPSHOT timestamp resolution).
+    pub fn version_metadata_url(&self, coord: &ArtifactCoord) -> String {
+        let group_path = coord.group_id.replace('.', "/");
+        format!(
+            "{}/{}/{}/{}/maven-metadata.xml",
+            self.url, group_path, coord.artifact_id, coord.version
         )
     }
 }
@@ -143,15 +153,28 @@ impl LocalRepository {
 // RepositorySystem
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RepositorySystem {
     pub local: LocalRepository,
-    pub remotes: Vec<RemoteRepository>,
+    remotes: RwLock<Vec<RemoteRepository>>,
+}
+
+impl Clone for RepositorySystem {
+    fn clone(&self) -> Self {
+        let remotes = self.remotes.read().unwrap().clone();
+        Self {
+            local: self.local.clone(),
+            remotes: RwLock::new(remotes),
+        }
+    }
 }
 
 impl RepositorySystem {
     pub fn new(local: LocalRepository, remotes: Vec<RemoteRepository>) -> Self {
-        Self { local, remotes }
+        Self {
+            local,
+            remotes: RwLock::new(remotes),
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -204,8 +227,23 @@ impl RepositorySystem {
         &self.local
     }
 
-    pub fn remotes(&self) -> &[RemoteRepository] {
-        &self.remotes
+    pub fn remotes(&self) -> Vec<RemoteRepository> {
+        self.remotes.read().unwrap().clone()
+    }
+
+    /// Add a remote repository if no existing remote has the same ID or URL.
+    /// Returns `true` if the repository was added.
+    pub fn add_remote_if_absent(&self, repo: RemoteRepository) -> bool {
+        let mut remotes = self.remotes.write().unwrap();
+        let url_normalized = repo.url.trim_end_matches('/');
+        let already_exists = remotes.iter().any(|r| {
+            r.id == repo.id || r.url.trim_end_matches('/') == url_normalized
+        });
+        if already_exists {
+            return false;
+        }
+        remotes.push(repo);
+        true
     }
 }
 
@@ -569,5 +607,48 @@ mod tests {
         let local = LocalRepository::new(dir.path());
         let versions = local.list_versions("no.such", "artifact");
         assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn add_remote_if_absent_dedup_by_id() {
+        let system = RepositorySystem::with_defaults();
+        // "central" already present
+        let added = system.add_remote_if_absent(
+            RemoteRepository::new("central", "https://other.url.com/repo"),
+        );
+        assert!(!added);
+        assert_eq!(system.remotes().len(), 1);
+    }
+
+    #[test]
+    fn add_remote_if_absent_dedup_by_url() {
+        let system = RepositorySystem::with_defaults();
+        let added = system.add_remote_if_absent(
+            RemoteRepository::new("other-id", "https://repo.maven.apache.org/maven2"),
+        );
+        assert!(!added);
+        assert_eq!(system.remotes().len(), 1);
+    }
+
+    #[test]
+    fn add_remote_if_absent_new_repo() {
+        let system = RepositorySystem::with_defaults();
+        let added = system.add_remote_if_absent(
+            RemoteRepository::new("jboss", "https://repository.jboss.org/nexus"),
+        );
+        assert!(added);
+        assert_eq!(system.remotes().len(), 2);
+        assert_eq!(system.remotes()[1].id, "jboss");
+    }
+
+    #[test]
+    fn version_metadata_url() {
+        let remote =
+            RemoteRepository::new("central", "https://repo.maven.apache.org/maven2");
+        let coord = ArtifactCoord::new("org.example", "lib", "1.0-SNAPSHOT");
+        assert_eq!(
+            remote.version_metadata_url(&coord),
+            "https://repo.maven.apache.org/maven2/org/example/lib/1.0-SNAPSHOT/maven-metadata.xml"
+        );
     }
 }

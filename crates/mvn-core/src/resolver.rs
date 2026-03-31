@@ -793,6 +793,23 @@ impl<'a> DependencyResolver<'a> {
 
             // Step 5: Inject dependency management into dependencies
             pom::inject_dependency_management(pom);
+
+            // Step 6: Register POM-declared repositories for transitive resolution.
+            // Maven uses repositories declared in any POM for resolving that POM's
+            // transitive dependencies. We add them to the shared repo system so
+            // subsequent fetches can find artifacts hosted in custom repos.
+            for repo in &pom.repositories.repository {
+                let id = repo.id.as_deref().unwrap_or("pom-repo");
+                let remote =
+                    crate::repository::RemoteRepository::new(id, &repo.url);
+                if self.downloader.repo_system().add_remote_if_absent(remote) {
+                    tracing::debug!(
+                        "registered POM repository: {} ({})",
+                        id,
+                        repo.url
+                    );
+                }
+            }
         })
     }
 

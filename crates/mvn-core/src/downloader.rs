@@ -372,19 +372,130 @@ impl ArtifactDownloader {
 
     // -- Public API ---------------------------------------------------------
 
+    /// Resolve the actual remote filename for a SNAPSHOT artifact.
+    ///
+    /// For a version like `1.0-SNAPSHOT`, Maven repositories store the actual
+    /// file with a timestamped name like `artifact-1.0-20231215.123456-42.jar`.
+    /// This method fetches the version-level `maven-metadata.xml` to determine
+    /// the correct timestamp and build number, returning the resolved base
+    /// version string (e.g. `1.0-20231215.123456-42`).
+    ///
+    /// Returns `None` if the version is not a SNAPSHOT or if metadata is
+    /// unavailable.
+    async fn resolve_snapshot_version(
+        &self,
+        coord: &ArtifactCoord,
+    ) -> Option<String> {
+        if !coord.version.ends_with("-SNAPSHOT") {
+            return None;
+        }
+
+        let base = coord.version.trim_end_matches("-SNAPSHOT");
+
+        for remote in self.repo_system.remotes() {
+            let url = remote.version_metadata_url(coord);
+            let creds = remote.credentials();
+
+            match self.fetch_text(&url, creds).await {
+                Ok(Some(text)) => {
+                    if let Ok(meta) = parse_metadata(&text) {
+                        if let Some(snap) = meta
+                            .versioning
+                            .as_ref()
+                            .and_then(|v| v.snapshot.as_ref())
+                        {
+                            if let (Some(ts), Some(bn)) =
+                                (&snap.timestamp, snap.build_number)
+                            {
+                                let resolved =
+                                    format!("{base}-{ts}-{bn}");
+                                tracing::debug!(
+                                    "resolved SNAPSHOT {} → {}",
+                                    coord.version,
+                                    resolved
+                                );
+                                return Some(resolved);
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        None
+    }
+
+    /// Build the remote URL for an artifact, resolving SNAPSHOT timestamps
+    /// when available.
+    fn snapshot_artifact_url(
+        remote: &crate::repository::RemoteRepository,
+        coord: &ArtifactCoord,
+        resolved_snap: Option<&str>,
+    ) -> String {
+        match resolved_snap {
+            Some(snap_ver) => {
+                let group_path = coord.group_id.replace('.', "/");
+                let classifier_part = match &coord.classifier {
+                    Some(c) => format!("-{c}"),
+                    None => String::new(),
+                };
+                format!(
+                    "{}/{}/{}/{}/{}-{}{}.{}",
+                    remote.url,
+                    group_path,
+                    coord.artifact_id,
+                    coord.version,
+                    coord.artifact_id,
+                    snap_ver,
+                    classifier_part,
+                    coord.extension,
+                )
+            }
+            None => remote.artifact_url(coord),
+        }
+    }
+
+    /// Build the remote POM URL, resolving SNAPSHOT timestamps.
+    fn snapshot_pom_url(
+        remote: &crate::repository::RemoteRepository,
+        coord: &ArtifactCoord,
+        resolved_snap: Option<&str>,
+    ) -> String {
+        match resolved_snap {
+            Some(snap_ver) => {
+                let group_path = coord.group_id.replace('.', "/");
+                format!(
+                    "{}/{}/{}/{}/{}-{}.pom",
+                    remote.url,
+                    group_path,
+                    coord.artifact_id,
+                    coord.version,
+                    coord.artifact_id,
+                    snap_ver,
+                )
+            }
+            None => remote.pom_url(coord),
+        }
+    }
+
     /// Download an artifact to the local repository.
     ///
     /// If the artifact already exists locally, returns its path immediately.
     /// Otherwise tries each remote repository in order (with retry).
+    /// For `-SNAPSHOT` versions, resolves the timestamped filename first.
     pub async fn download_artifact(&self, coord: &ArtifactCoord) -> Result<PathBuf> {
         if self.repo_system.local.has_artifact(coord) {
             tracing::debug!("artifact {} found in local repository", coord);
             return Ok(self.repo_system.local.artifact_path(coord));
         }
 
+        // Resolve SNAPSHOT timestamp if applicable
+        let snap_ver = self.resolve_snapshot_version(coord).await;
+
         let mut last_err: Option<MvnError> = None;
         for remote in self.repo_system.remotes() {
-            let url = remote.artifact_url(coord);
+            let url = Self::snapshot_artifact_url(&remote, coord, snap_ver.as_deref());
             let creds = remote.credentials();
             tracing::debug!("trying {} from {}", coord, remote.id);
 
@@ -414,6 +525,7 @@ impl ArtifactDownloader {
     /// Download a POM file and return its content as a string.
     ///
     /// Checks the local repository first, then tries each remote.
+    /// For `-SNAPSHOT` versions, resolves the timestamped filename first.
     pub async fn download_pom(&self, coord: &ArtifactCoord) -> Result<String> {
         // Try local first
         if let Ok(content) = self.repo_system.local.read_pom(coord) {
@@ -428,9 +540,12 @@ impl ArtifactDownloader {
             "pom",
         );
 
+        // Resolve SNAPSHOT timestamp if applicable
+        let snap_ver = self.resolve_snapshot_version(coord).await;
+
         let mut last_err: Option<MvnError> = None;
         for remote in self.repo_system.remotes() {
-            let url = remote.pom_url(coord);
+            let url = Self::snapshot_pom_url(&remote, coord, snap_ver.as_deref());
             let creds = remote.credentials();
             tracing::debug!("trying POM for {} from {}", coord, remote.id);
 
@@ -1252,5 +1367,71 @@ mod tests {
         let dl = ArtifactDownloader::from_settings(&settings);
         assert_eq!(dl.repo_system().remotes().len(), 1);
         assert_eq!(dl.retry_config().max_retries, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // SNAPSHOT URL construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_artifact_url_with_timestamp() {
+        let remote = RemoteRepository::maven_central();
+        let coord = ArtifactCoord::new("org.example", "snap-lib", "1.0-SNAPSHOT");
+        let url = ArtifactDownloader::snapshot_artifact_url(
+            &remote,
+            &coord,
+            Some("1.0-20231215.123456-42"),
+        );
+        assert_eq!(
+            url,
+            "https://repo.maven.apache.org/maven2/org/example/snap-lib/1.0-SNAPSHOT/snap-lib-1.0-20231215.123456-42.jar"
+        );
+    }
+
+    #[test]
+    fn snapshot_artifact_url_without_timestamp_falls_back() {
+        let remote = RemoteRepository::maven_central();
+        let coord = ArtifactCoord::new("org.example", "snap-lib", "1.0-SNAPSHOT");
+        let url = ArtifactDownloader::snapshot_artifact_url(&remote, &coord, None);
+        assert_eq!(url, remote.artifact_url(&coord));
+    }
+
+    #[test]
+    fn snapshot_pom_url_with_timestamp() {
+        let remote = RemoteRepository::maven_central();
+        let coord = ArtifactCoord::new("org.example", "snap-lib", "1.0-SNAPSHOT");
+        let url = ArtifactDownloader::snapshot_pom_url(
+            &remote,
+            &coord,
+            Some("1.0-20231215.123456-42"),
+        );
+        assert_eq!(
+            url,
+            "https://repo.maven.apache.org/maven2/org/example/snap-lib/1.0-SNAPSHOT/snap-lib-1.0-20231215.123456-42.pom"
+        );
+    }
+
+    #[test]
+    fn snapshot_pom_url_without_timestamp_falls_back() {
+        let remote = RemoteRepository::maven_central();
+        let coord = ArtifactCoord::new("org.example", "snap-lib", "1.0-SNAPSHOT");
+        let url = ArtifactDownloader::snapshot_pom_url(&remote, &coord, None);
+        assert_eq!(url, remote.pom_url(&coord));
+    }
+
+    #[test]
+    fn snapshot_artifact_url_with_classifier() {
+        let remote = RemoteRepository::maven_central();
+        let mut coord = ArtifactCoord::new("org.example", "snap-lib", "1.0-SNAPSHOT");
+        coord.classifier = Some("sources".into());
+        let url = ArtifactDownloader::snapshot_artifact_url(
+            &remote,
+            &coord,
+            Some("1.0-20231215.123456-42"),
+        );
+        assert_eq!(
+            url,
+            "https://repo.maven.apache.org/maven2/org/example/snap-lib/1.0-SNAPSHOT/snap-lib-1.0-20231215.123456-42-sources.jar"
+        );
     }
 }
