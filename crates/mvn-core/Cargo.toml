@@ -1,0 +1,25 @@
+[package]
+name = "mvn-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+indicatif.workspace = true
+hex.workspace = true
+futures.workspace = true
+colored.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+wiremock.workspace = true
+tempfile.workspace = true

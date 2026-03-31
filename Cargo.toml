@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mvn-core",
+    "crates/mvn-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+mvn-core = { path = "crates/mvn-core" }
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+sha1 = "0.10"
+sha2 = "0.10"
+dirs = "6"
+indicatif = "0.17"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+futures = "0.3"
+colored = "2"
+comfy-table = "7"
+wiremock = "0.6"
+tempfile = "3"

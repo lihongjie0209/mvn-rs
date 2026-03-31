@@ -1,0 +1,15 @@
+[package]
+name = "mvn-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mvn-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+indicatif.workspace = true
+colored.workspace = true
+comfy-table.workspace = true
