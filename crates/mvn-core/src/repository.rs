@@ -116,6 +116,27 @@ impl LocalRepository {
         std::fs::write(&path, data)?;
         Ok(path)
     }
+
+    /// List locally cached versions for a groupId:artifactId by scanning
+    /// the directory structure. Returns an empty Vec if the directory does
+    /// not exist.
+    pub fn list_versions(&self, group_id: &str, artifact_id: &str) -> Vec<String> {
+        let group_path = group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
+        let dir = self.root.join(group_path).join(artifact_id);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| {
+                let e = e.ok()?;
+                if e.file_type().ok()?.is_dir() {
+                    Some(e.file_name().to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,5 +543,31 @@ mod tests {
         let result = apply_mirrors(&repos, &mirrors, &servers);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "my-repo");
+    }
+
+    #[test]
+    fn list_versions_from_local_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalRepository::new(dir.path());
+
+        // Create some version directories
+        let base = dir.path().join("org").join("example").join("lib");
+        std::fs::create_dir_all(base.join("1.0")).unwrap();
+        std::fs::create_dir_all(base.join("2.0")).unwrap();
+        std::fs::create_dir_all(base.join("3.0-beta")).unwrap();
+        // Also create a file (should be ignored)
+        std::fs::write(base.join("_remote.repositories"), "").unwrap();
+
+        let mut versions = local.list_versions("org.example", "lib");
+        versions.sort();
+        assert_eq!(versions, vec!["1.0", "2.0", "3.0-beta"]);
+    }
+
+    #[test]
+    fn list_versions_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalRepository::new(dir.path());
+        let versions = local.list_versions("no.such", "artifact");
+        assert!(versions.is_empty());
     }
 }

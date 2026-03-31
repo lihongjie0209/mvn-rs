@@ -630,14 +630,39 @@ impl<'a> DependencyResolver<'a> {
         range_str: &str,
     ) -> Option<String> {
         let constraint = VersionConstraint::parse(range_str).ok()?;
+
+        // Try remote metadata first, fall back to local directory listing
+        let versions_owned: Vec<String>;
         let metadata = self
             .downloader
             .fetch_metadata(group_id, artifact_id)
-            .await
-            .ok()?;
+            .await;
 
-        let versions = metadata.available_versions();
-        let mut matching: Vec<(&str, Version)> = versions
+        let version_strs: Vec<&str> = match &metadata {
+            Ok(m) => m.available_versions(),
+            Err(e) => {
+                tracing::debug!(
+                    "metadata fetch failed for {}:{} (range {}): {}, trying local",
+                    group_id, artifact_id, range_str, e
+                );
+                // Fallback: scan local repository directory for cached versions
+                versions_owned = self
+                    .downloader
+                    .repo_system()
+                    .local
+                    .list_versions(group_id, artifact_id);
+                if versions_owned.is_empty() {
+                    warn!(
+                        "failed to fetch metadata for {}:{} (range {}): {}",
+                        group_id, artifact_id, range_str, e
+                    );
+                    return None;
+                }
+                versions_owned.iter().map(|s| s.as_str()).collect()
+            }
+        };
+
+        let mut matching: Vec<(&str, Version)> = version_strs
             .into_iter()
             .filter_map(|v| {
                 let parsed = Version::new(v);

@@ -382,6 +382,7 @@ impl ArtifactDownloader {
             return Ok(self.repo_system.local.artifact_path(coord));
         }
 
+        let mut last_err: Option<MvnError> = None;
         for remote in self.repo_system.remotes() {
             let url = remote.artifact_url(coord);
             let creds = remote.credentials();
@@ -397,13 +398,17 @@ impl ArtifactDownloader {
                     tracing::debug!("{} not found in {}", coord, remote.id);
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    tracing::debug!("{} failed in {}: {}", coord, remote.id, e);
+                    last_err = Some(e);
+                    continue;
+                }
             }
         }
 
-        Err(MvnError::ArtifactNotFound {
+        Err(last_err.unwrap_or(MvnError::ArtifactNotFound {
             coord: coord.to_string(),
-        })
+        }))
     }
 
     /// Download a POM file and return its content as a string.
@@ -423,29 +428,35 @@ impl ArtifactDownloader {
             "pom",
         );
 
+        let mut last_err: Option<MvnError> = None;
         for remote in self.repo_system.remotes() {
             let url = remote.pom_url(coord);
             let creds = remote.credentials();
             tracing::debug!("trying POM for {} from {}", coord, remote.id);
 
-            match self.fetch_text(&url, creds).await? {
-                Some(text) => {
+            match self.fetch_text(&url, creds).await {
+                Ok(Some(text)) => {
                     // Store in local repo
                     self.repo_system
                         .local
                         .store_artifact(&pom_coord, text.as_bytes())?;
                     return Ok(text);
                 }
-                None => {
+                Ok(None) => {
                     tracing::debug!("POM for {} not found in {}", coord, remote.id);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("POM for {} failed in {}: {}", coord, remote.id, e);
+                    last_err = Some(e);
                     continue;
                 }
             }
         }
 
-        Err(MvnError::ArtifactNotFound {
+        Err(last_err.unwrap_or(MvnError::ArtifactNotFound {
             coord: coord.to_string(),
-        })
+        }))
     }
 
     /// Download and parse a POM file.
@@ -462,16 +473,17 @@ impl ArtifactDownloader {
         group_id: &str,
         artifact_id: &str,
     ) -> Result<MavenMetadata> {
+        let mut last_err: Option<MvnError> = None;
         for remote in self.repo_system.remotes() {
             let url = remote.metadata_url(group_id, artifact_id);
             let creds = remote.credentials();
             tracing::debug!("fetching metadata from {}", url);
 
-            match self.fetch_text(&url, creds).await? {
-                Some(text) => {
+            match self.fetch_text(&url, creds).await {
+                Ok(Some(text)) => {
                     return parse_metadata(&text);
                 }
-                None => {
+                Ok(None) => {
                     tracing::debug!(
                         "metadata for {}:{} not found in {}",
                         group_id,
@@ -480,12 +492,23 @@ impl ArtifactDownloader {
                     );
                     continue;
                 }
+                Err(e) => {
+                    tracing::debug!(
+                        "metadata for {}:{} failed in {}: {}",
+                        group_id,
+                        artifact_id,
+                        remote.id,
+                        e
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
             }
         }
 
-        Err(MvnError::ArtifactNotFound {
+        Err(last_err.unwrap_or(MvnError::ArtifactNotFound {
             coord: format!("{}:{}", group_id, artifact_id),
-        })
+        }))
     }
 
     // -- Batch / concurrent API ---------------------------------------------
