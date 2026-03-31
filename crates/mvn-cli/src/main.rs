@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,6 +15,46 @@ use mvn_core::coord::{ArtifactCoord, DependencyScope};
 use mvn_core::downloader::{ArtifactDownloader, RetryConfig};
 use mvn_core::resolver::{format_tree, DependencyResolver};
 use mvn_core::settings;
+
+// ---------------------------------------------------------------------------
+// Global MultiProgress handle for routing tracing output through indicatif
+// ---------------------------------------------------------------------------
+
+/// Global multi-progress handle.  When set, the tracing subscriber routes
+/// all log output through `mp.println()` so warnings scroll below the
+/// progress bars instead of overwriting them.
+static GLOBAL_MP: OnceLock<MultiProgress> = OnceLock::new();
+
+/// A writer that routes output through the global [`MultiProgress`] when
+/// available, falling back to stderr otherwise.
+#[derive(Clone)]
+struct IndicatifWriter;
+
+impl std::io::Write for IndicatifWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(mp) = GLOBAL_MP.get() {
+            let s = String::from_utf8_lossy(buf);
+            let s = s.trim_end_matches('\n');
+            if !s.is_empty() {
+                let _ = mp.println(s);
+            }
+        } else {
+            std::io::stderr().write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for IndicatifWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -104,7 +144,11 @@ fn parse_scope_filter(s: &str) -> Result<Option<DependencyScope>> {
 }
 
 fn spinner(msg: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+    let pb = if let Some(mp) = GLOBAL_MP.get() {
+        mp.add(ProgressBar::new_spinner())
+    } else {
+        ProgressBar::new_spinner()
+    };
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .unwrap()
@@ -310,8 +354,9 @@ async fn cmd_download(
     //  📦 com.google.guava:guava:33.4.0-jre (+7 dependencies)
     //  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7/7
     //  resolved 7, reused 5, downloaded 2 (1.2 MB), added 7, done
+    //  (warnings scroll below)
     //
-    let mp = MultiProgress::new();
+    let mp = GLOBAL_MP.get().cloned().unwrap_or_else(MultiProgress::new);
 
     // Header (static)
     let header = mp.add(ProgressBar::new(0));
@@ -609,11 +654,18 @@ fn build_downloader(cli: &Cli) -> anyhow::Result<ArtifactDownloader> {
 
 #[tokio::main]
 async fn main() {
+    // Initialise the global MultiProgress *before* tracing so that any
+    // warn! / info! output from the core crate is routed through it.
+    let mp = MultiProgress::new();
+    let _ = GLOBAL_MP.set(mp);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
+        .with_writer(IndicatifWriter)
+        .with_ansi(true)
         .init();
 
     let cli = Cli::parse();
