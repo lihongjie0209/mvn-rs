@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::coord::{ArtifactCoord, DependencyScope, Exclusion};
@@ -214,11 +217,17 @@ pub fn format_tree_plain(root: &ArtifactCoord, nodes: &[DependencyNode]) -> Stri
 /// - Scope propagation matrix & "Nearest Wins" conflict resolution
 pub struct DependencyResolver<'a> {
     downloader: &'a ArtifactDownloader,
+    /// Cache for resolved effective POMs to avoid re-fetching the same parent
+    /// chain multiple times during transitive resolution.
+    pom_cache: Arc<RwLock<HashMap<String, pom::Pom>>>,
 }
 
 impl<'a> DependencyResolver<'a> {
     pub fn new(downloader: &'a ArtifactDownloader) -> Self {
-        Self { downloader }
+        Self {
+            downloader,
+            pom_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     /// Full resolution: collect → flatten → download artifacts.
@@ -261,16 +270,19 @@ impl<'a> DependencyResolver<'a> {
     /// entries. These are propagated through the entire transitive tree so that
     /// the root project's version overrides always win — matching Maven behavior.
     async fn collect(&self, coord: &ArtifactCoord) -> Result<Vec<DependencyNode>> {
-        let mut visited = HashSet::new();
-        visited.insert((coord.group_id.clone(), coord.artifact_id.clone()));
+        let visited = Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut v = visited.lock().await;
+            v.insert((coord.group_id.clone(), coord.artifact_id.clone()));
+        }
 
         let pom = self.fetch_and_prepare_pom(coord).await?;
 
         // Extract root-level dependencyManagement as a lookup map.
         // Maven propagates the root project's DM to ALL transitive deps.
-        let root_managed = Self::build_managed_map(&pom);
+        let root_managed = Arc::new(Self::build_managed_map(&pom));
 
-        self.collect_children(pom, Vec::new(), &mut visited, 0, &root_managed)
+        self.collect_children(pom, Vec::new(), visited, 0, root_managed)
             .await
     }
 
@@ -293,24 +305,24 @@ impl<'a> DependencyResolver<'a> {
     /// `root_managed` carries the root project's `dependencyManagement` entries
     /// through the entire transitive tree so that version overrides from the
     /// top-level POM always win.
-    fn collect_children<'s, 'v>(
-        &'s self,
+    ///
+    /// Pass 3 runs transitive POM preparation and child collection concurrently
+    /// using `FuturesUnordered` for maximum parallelism.
+    fn collect_children(
+        &self,
         pom: pom::Pom,
         parent_exclusions: Vec<Exclusion>,
-        visited: &'v mut HashSet<(String, String)>,
+        visited: Arc<Mutex<HashSet<(String, String)>>>,
         depth: usize,
-        root_managed: &'v HashMap<(String, String), pom::PomDependency>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyNode>>> + Send + 'v>>
-    where
-        's: 'v,
-    {
+        root_managed: Arc<HashMap<(String, String), pom::PomDependency>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyNode>>> + Send + '_>> {
         Box::pin(async move {
             if depth >= MAX_DEPTH {
                 warn!("maximum dependency depth ({MAX_DEPTH}) reached; truncating");
                 return Ok(Vec::new());
             }
 
-            // -- Pass 1: filter deps & mark visited (sequential, cheap) -----
+            // -- Pass 1: filter deps & mark visited -------------------------
             struct DepInfo {
                 coord: ArtifactCoord,
                 scope: DependencyScope,
@@ -345,7 +357,15 @@ impl<'a> DependencyResolver<'a> {
                     managed.version.clone().unwrap_or_default()
                 } else {
                     match &dep.version {
-                        Some(v) if !v.is_empty() => v.clone(),
+                        Some(v) if !v.is_empty() && !v.contains("${") => v.clone(),
+                        Some(v) if !v.is_empty() => {
+                            // Version still contains unresolved ${...}; skip
+                            warn!(
+                                "skipping {}:{} — unresolved version: {}",
+                                dep.group_id, dep.artifact_id, v
+                            );
+                            continue;
+                        }
                         _ => {
                             warn!(
                                 "skipping {}:{} — no version specified",
@@ -356,10 +376,10 @@ impl<'a> DependencyResolver<'a> {
                     }
                 };
 
-                if version.is_empty() {
+                if version.is_empty() || version.contains("${") {
                     warn!(
-                        "skipping {}:{} — empty version after DM lookup",
-                        dep.group_id, dep.artifact_id
+                        "skipping {}:{} — unresolved version after DM lookup: {}",
+                        dep.group_id, dep.artifact_id, version
                     );
                     continue;
                 }
@@ -414,7 +434,10 @@ impl<'a> DependencyResolver<'a> {
                     .collect();
 
                 let key = (dep.group_id.clone(), dep.artifact_id.clone());
-                let needs_recurse = visited.insert(key);
+                let needs_recurse = {
+                    let mut v = visited.lock().await;
+                    v.insert(key)
+                };
 
                 let mut child_exclusions = parent_exclusions.clone();
                 if needs_recurse {
@@ -446,98 +469,121 @@ impl<'a> DependencyResolver<'a> {
                 .map(|(coord, result)| (coord.to_string(), result))
                 .collect();
 
-            // -- Pass 3: build nodes, recurse into children sequentially ----
-            let mut nodes = Vec::new();
+            // -- Pass 3: build nodes, recurse concurrently ------------------
+            // Separate leaf nodes (no recursion needed) from recurse nodes.
+            let mut leaf_nodes: Vec<(usize, DependencyNode)> = Vec::new();
+            let mut recurse_tasks = FuturesUnordered::new();
 
-            for info in dep_infos {
+            for (idx, info) in dep_infos.into_iter().enumerate() {
                 if !info.needs_recurse {
-                    nodes.push(DependencyNode {
-                        coord: info.coord,
-                        scope: info.scope,
-                        optional: false,
-                        exclusions: Vec::new(),
-                        children: Vec::new(),
-                    });
+                    leaf_nodes.push((
+                        idx,
+                        DependencyNode {
+                            coord: info.coord,
+                            scope: info.scope,
+                            optional: false,
+                            exclusions: Vec::new(),
+                            children: Vec::new(),
+                        },
+                    ));
                     continue;
                 }
 
-                let children = match pom_map.remove(&info.coord.to_string()) {
-                    Some(Ok(raw_pom)) => {
-                        // Apply full effective-model pipeline to each transitive POM
-                        let mut child_pom = raw_pom;
-                        self.prepare_pom(&mut child_pom, 0).await;
+                let pom_result = pom_map.remove(&info.coord.to_string());
+                let visited = visited.clone();
+                let root_managed = root_managed.clone();
 
-                        // Check for POM relocation
-                        if let Some(relocated) =
-                            Self::check_relocation(&child_pom, &info.coord)
-                        {
-                            warn!(
-                                "artifact {} relocated to {}",
-                                info.coord, relocated
-                            );
-                            // Fetch the relocated POM and use it instead
-                            match self.fetch_and_prepare_pom(&relocated).await {
-                                Ok(relocated_pom) => {
-                                    self.collect_children(
-                                        relocated_pom,
-                                        info.child_exclusions,
-                                        visited,
-                                        depth + 1,
-                                        root_managed,
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
+                recurse_tasks.push(async move {
+                    let children = match pom_result {
+                        Some(Ok(raw_pom)) => {
+                            let mut child_pom = raw_pom;
+                            self.prepare_pom(&mut child_pom, 0).await;
+
+                            // Check for POM relocation
+                            if let Some(relocated) =
+                                Self::check_relocation(&child_pom, &info.coord)
+                            {
+                                warn!(
+                                    "artifact {} relocated to {}",
+                                    info.coord, relocated
+                                );
+                                match self.fetch_and_prepare_pom(&relocated).await {
+                                    Ok(relocated_pom) => {
+                                        self.collect_children(
+                                            relocated_pom,
+                                            info.child_exclusions,
+                                            visited,
+                                            depth + 1,
+                                            root_managed,
+                                        )
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            warn!(
+                                                "failed collecting deps for relocated {}: {e}",
+                                                relocated
+                                            );
+                                            Vec::new()
+                                        })
+                                    }
+                                    Err(e) => {
                                         warn!(
-                                            "failed collecting deps for relocated {}: {e}",
+                                            "failed to fetch relocated POM {}: {e}",
                                             relocated
                                         );
                                         Vec::new()
-                                    })
+                                    }
                                 }
-                                Err(e) => {
+                            } else {
+                                self.collect_children(
+                                    child_pom,
+                                    info.child_exclusions,
+                                    visited,
+                                    depth + 1,
+                                    root_managed,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
                                     warn!(
-                                        "failed to fetch relocated POM {}: {e}",
-                                        relocated
+                                        "failed to collect transitive deps for {}: {e}",
+                                        info.coord
                                     );
                                     Vec::new()
-                                }
+                                })
                             }
-                        } else {
-                            self.collect_children(
-                                child_pom,
-                                info.child_exclusions,
-                                visited,
-                                depth + 1,
-                                root_managed,
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                warn!(
-                                    "failed to collect transitive deps for {}: {e}",
-                                    info.coord
-                                );
-                                Vec::new()
-                            })
                         }
-                    }
-                    Some(Err(e)) => {
-                        warn!("failed to fetch POM for {}: {e}", info.coord);
-                        Vec::new()
-                    }
-                    None => {
-                        warn!("POM result missing for {}", info.coord);
-                        Vec::new()
-                    }
-                };
+                        Some(Err(e)) => {
+                            warn!("failed to fetch POM for {}: {e}", info.coord);
+                            Vec::new()
+                        }
+                        None => {
+                            warn!("POM result missing for {}", info.coord);
+                            Vec::new()
+                        }
+                    };
 
-                nodes.push(DependencyNode {
-                    coord: info.coord,
-                    scope: info.scope,
-                    optional: false,
-                    exclusions: info.exclusions,
-                    children,
+                    (
+                        idx,
+                        DependencyNode {
+                            coord: info.coord,
+                            scope: info.scope,
+                            optional: false,
+                            exclusions: info.exclusions,
+                            children,
+                        },
+                    )
                 });
             }
+
+            // Collect all results (leaf + concurrent)
+            let mut indexed_nodes: Vec<(usize, DependencyNode)> = leaf_nodes;
+            while let Some((idx, node)) = recurse_tasks.next().await {
+                indexed_nodes.push((idx, node));
+            }
+
+            // Restore original order
+            indexed_nodes.sort_by_key(|(idx, _)| *idx);
+            let nodes: Vec<DependencyNode> =
+                indexed_nodes.into_iter().map(|(_, n)| n).collect();
 
             Ok(nodes)
         })
@@ -616,15 +662,36 @@ impl<'a> DependencyResolver<'a> {
     /// Fetch a POM and resolve its full effective model by walking the parent
     /// chain recursively.
     ///
-    /// Uses `Pin<Box<…>>` to support async recursion through the parent chain.
+    /// Results are cached in `pom_cache` to avoid re-fetching the same parent
+    /// POMs repeatedly during transitive resolution. This dramatically improves
+    /// performance for large dependency trees where many artifacts share common
+    /// parents (e.g., `org.apache:apache`, Spring Boot parent, etc.).
     fn resolve_effective_pom(
         &self,
         coord: ArtifactCoord,
         parent_depth: usize,
     ) -> Pin<Box<dyn Future<Output = Result<pom::Pom>> + Send + '_>> {
         Box::pin(async move {
+            let cache_key = coord.to_string();
+
+            // Check cache first (read lock, cheap)
+            {
+                let cache = self.pom_cache.read().await;
+                if let Some(pom) = cache.get(&cache_key) {
+                    return Ok(pom.clone());
+                }
+            }
+
+            // Cache miss — fetch and prepare
             let mut pom = self.downloader.fetch_pom(&coord).await?;
             self.prepare_pom(&mut pom, parent_depth).await;
+
+            // Store in cache (write lock)
+            {
+                let mut cache = self.pom_cache.write().await;
+                cache.insert(cache_key, pom.clone());
+            }
+
             Ok(pom)
         })
     }
@@ -686,7 +753,11 @@ impl<'a> DependencyResolver<'a> {
             // Step 3: Resolve BOM imports (import-scope entries in dependencyManagement)
             self.resolve_bom_imports(pom, parent_depth).await;
 
-            // Step 4: Inject dependency management into dependencies
+            // Step 4: Re-interpolate after BOM imports to resolve any remaining
+            // property references introduced by imported BOM entries
+            pom::interpolate_pom(pom);
+
+            // Step 5: Inject dependency management into dependencies
             pom::inject_dependency_management(pom);
         })
     }

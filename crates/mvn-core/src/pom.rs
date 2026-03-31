@@ -363,23 +363,53 @@ pub fn interpolate(input: &str, properties: &HashMap<String, String>) -> String 
 pub fn interpolate_pom(pom: &mut Pom) {
     let mut props = pom.properties.entries.clone();
 
-    // Populate project.* properties
+    // Populate project.* properties — always override to reflect THIS POM's
+    // identity, not stale values from a parent merge.
     if let Some(gid) = &pom.group_id {
-        props.entry("project.groupId".into()).or_insert_with(|| gid.clone());
+        props.insert("project.groupId".into(), gid.clone());
     } else if let Some(parent) = &pom.parent {
-        props.entry("project.groupId".into()).or_insert_with(|| parent.group_id.clone());
+        props.insert("project.groupId".into(), parent.group_id.clone());
     }
     if let Some(aid) = &pom.artifact_id {
-        props.entry("project.artifactId".into()).or_insert_with(|| aid.clone());
+        props.insert("project.artifactId".into(), aid.clone());
     }
     if let Some(ver) = &pom.version {
-        props.entry("project.version".into()).or_insert_with(|| ver.clone());
+        props.insert("project.version".into(), ver.clone());
     } else if let Some(parent) = &pom.parent {
-        props.entry("project.version".into()).or_insert_with(|| parent.version.clone());
+        props.insert("project.version".into(), parent.version.clone());
     }
-    props
-        .entry("project.packaging".into())
-        .or_insert_with(|| pom.effective_packaging().to_string());
+    props.insert(
+        "project.packaging".into(),
+        pom.effective_packaging().to_string(),
+    );
+
+    // Legacy Maven 1.x aliases: pom.* → same as project.*
+    if let Some(gid) = props.get("project.groupId") {
+        let gid = gid.clone();
+        props.insert("pom.groupId".into(), gid);
+    }
+    if let Some(aid) = props.get("project.artifactId") {
+        let aid = aid.clone();
+        props.insert("pom.artifactId".into(), aid);
+    }
+    if let Some(ver) = props.get("project.version") {
+        let ver = ver.clone();
+        props.insert("pom.version".into(), ver);
+    }
+    if let Some(name) = &pom.name {
+        props.insert("pom.name".into(), name.clone());
+    }
+
+    // project.parent.* properties — always use the ORIGINAL parent reference
+    if let Some(parent) = &pom.parent {
+        props.insert("project.parent.groupId".into(), parent.group_id.clone());
+        props.insert("project.parent.artifactId".into(), parent.artifact_id.clone());
+        props.insert("project.parent.version".into(), parent.version.clone());
+        // Legacy aliases
+        props.insert("parent.groupId".into(), parent.group_id.clone());
+        props.insert("parent.artifactId".into(), parent.artifact_id.clone());
+        props.insert("parent.version".into(), parent.version.clone());
+    }
 
     // Populate env.* properties from environment variables
     for (key, value) in std::env::vars() {
@@ -471,8 +501,17 @@ pub fn merge_parent(child: &mut Pom, parent: &Pom) {
         child.version = parent.version.clone();
     }
 
-    // Properties: parent defaults, child overrides
-    let mut merged = parent.properties.entries.clone();
+    // Properties: parent defaults, child overrides.
+    // IMPORTANT: strip synthetic properties (project.*, pom.*, parent.*) from
+    // the parent before merging — these are re-computed during interpolation
+    // for each POM and must reflect the current POM's identity, not the parent's.
+    let mut merged: HashMap<String, String> = parent.properties.entries
+        .iter()
+        .filter(|(k, _)| {
+            !k.starts_with("project.") && !k.starts_with("pom.") && !k.starts_with("parent.")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     for (k, v) in &child.properties.entries {
         merged.insert(k.clone(), v.clone());
     }
@@ -1238,5 +1277,55 @@ mod tests {
         let os_prop = pom.properties.entries.get("my.os").unwrap();
         assert!(!os_prop.contains("${"), "os.name should be interpolated, got: {os_prop}");
         std::env::remove_var("MVN_RS_TEST_PROP");
+    }
+
+    #[test]
+    fn test_pom_legacy_aliases() {
+        let xml = r#"
+        <project>
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.apache.felix</groupId>
+            <artifactId>felix-framework</artifactId>
+            <version>2.0.2</version>
+            <dependencies>
+                <dependency>
+                    <groupId>${pom.groupId}</groupId>
+                    <artifactId>some-dep</artifactId>
+                    <version>${pom.version}</version>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let mut pom = parse_pom(xml).unwrap();
+        interpolate_pom(&mut pom);
+        let dep = &pom.dependencies.dependency[0];
+        assert_eq!(dep.group_id, "org.apache.felix");
+        assert_eq!(dep.version, Some("2.0.2".into()));
+    }
+
+    #[test]
+    fn test_project_parent_properties() {
+        let xml = r#"
+        <project>
+            <modelVersion>4.0.0</modelVersion>
+            <parent>
+                <groupId>org.apache.mina</groupId>
+                <artifactId>mina-parent</artifactId>
+                <version>3.1.0</version>
+            </parent>
+            <artifactId>mina-core</artifactId>
+            <dependencies>
+                <dependency>
+                    <groupId>org.apache.mina</groupId>
+                    <artifactId>mina-utils</artifactId>
+                    <version>${project.parent.version}</version>
+                </dependency>
+            </dependencies>
+        </project>"#;
+
+        let mut pom = parse_pom(xml).unwrap();
+        interpolate_pom(&mut pom);
+        let dep = &pom.dependencies.dependency[0];
+        assert_eq!(dep.version, Some("3.1.0".into()));
     }
 }
